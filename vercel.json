@@ -1,9 +1,11 @@
 {
   "framework": null,
   "buildCommand": null,
-  "installCommand": null,
   "outputDirectory": "website",
-  "trailingSlash": true,
+  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/index" }],
+  "functions": {
+    "api/index.py": { "maxDuration": 60, "includeFiles": "local-builder/**" }
+  },
   "headers": [
     {
       "source": "/(.*)",
