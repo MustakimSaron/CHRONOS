@@ -744,7 +744,15 @@
     function connBegin(k) { if (k) { connS[k].n++; connRender(); } }
     function connEnd(k, ok, note) { if (!k) return; const s = connS[k]; s.n = Math.max(0, s.n - 1); if (ok === true) { s.ok++; s.okNote = note || ""; } else if (ok === false) { s.bad++; s.badNote = note || ""; } connRender(); }
     function connReset(k) { const s = connS[k]; if (s) { s.n = 0; s.ok = 0; s.bad = 0; s.okNote = ""; s.badNote = ""; connRender(); } }
-    const connShort = m => /time|50[234]|abort|no answer/i.test(String(m)) ? "no answer in time" : /Failed to fetch|NetworkError|CORS/i.test(String(m)) ? "blocked / unreachable" : (String(m).replace(/https?:\/\/\S+/g, "").slice(0, 60) || "failed");
+    const connShort = m => {
+      const s = String(m || "");
+      if (/HTTP 504|ReadTimeout|ConnectTimeout|timed? out|no answer within|AbortError/i.test(s)) return "timed out";
+      if (/HTTP 503|temporarily unavailable|ConnectionError|Failed to establish a new connection/i.test(s)) return "service unavailable";
+      if (/HTTP 502|TAP error|archive\/query error|query failed/i.test(s)) return "archive / query error";
+      if (/Failed to fetch|NetworkError|CORS|blocked/i.test(s)) return "blocked / unreachable";
+      if (/no matches|zero rows|no sources/i.test(s)) return "connected · no matches";
+      return (s.replace(/https?:\/\/\S+/g, "").slice(0, 60) || "failed");
+    };
     const CONN_RETRY = { spx: () => { realKey = null; ensureRealField(); }, jpl: () => { knownKey = null; checkKnownObjects(false); }, neo: () => crossCheckWISE() };
     function connRender() {
       const box = document.getElementById("conn-rows"); if (!box) return;
@@ -1764,7 +1772,7 @@
       const el = $("real-notice"); if (!el) return;
       let t = "";
       if (dataMode === "real") {
-        if (realState === "loading") t = "Loading real SPHEREx exposures from IRSA… the simulation is shown until they arrive (first time per field: 10–60 s).";
+        if (realState === "loading") t = "Loading real SPHEREx exposures from IRSA… the simulation is shown until they arrive (first time per field: it can take a few minutes).";
         else if (realState === "error") t = realErr;
         else if (realState === "empty") t = realErr || "SPHEREx has not observed this position in the public releases yet.";
       }
@@ -1776,7 +1784,7 @@
       if (key === realKey) { realNotice(); return; }
       realKey = key; realField = null; realState = "loading"; connReset("spx"); realNotice();
       const myKey = key, t0 = performance.now();
-      fetchJSON(`${backendBase()}/api/spherex/field?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}`, 240000)
+      fetchJSON(`${backendBase()}/api/spherex/field?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}`, 280000)
         .then(j => {
           if (myKey !== realKey) return;
           (j.errors || []).slice(0, 3).forEach(e => logLine("WARN", "SPHEREx: " + e));
@@ -1791,7 +1799,15 @@
           logLine("OK  ", `Real SPHEREx: ${j.frames.length} exposures (D${[...new Set(j.frames.map(f => f.det))].join(",D")}) of ${j.n_available} available, visits ${fmtMJD(j.epochs_mjd[0])} and ${fmtMJD(j.epochs_mjd[1])}${j.cached ? " (cached)" : ""} in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
           updateAll(true);
         })
-        .catch(e => { if (myKey !== realKey) return; realState = "error"; realErr = (/50[234]|timeout|abort|Proxy|fetch/i.test(String(e && (e.message || e.name))) ? "NASA’s IRSA archive did not answer in time (it is busy or slow right now). Press “Real SPHEREx data” again in a minute." : "Real SPHEREx data could not be loaded for this position.") + " The simulated field is shown instead."; logLine("WARN", realErr); realNotice(); updateAll(false); });
+        .catch(e => { if (myKey !== realKey) return; realState = "error";
+          const raw = String(e && (e.message || e.name) || "");
+          const why = connShort(raw);
+          const advice = why === "timed out" ? "IRSA did not finish the SPHEREx request before the timeout. Retry in a moment." :
+            why === "service unavailable" ? "IRSA is temporarily unavailable or unreachable. Retry in a moment." :
+            why === "archive / query error" ? "IRSA returned an archive or query error. Check the server diagnostic details before retrying." :
+            "The SPHEREx archive request could not be completed.";
+          realErr = advice + " The simulated field is shown instead.";
+          logLine("WARN", realErr + (raw ? " [" + raw.slice(0, 220) + "]" : "")); realNotice(); updateAll(false); });
     }
     function realStack(dets, ep) {
       const fr = realField.frames.filter(f => f.epoch === ep && dets.includes(f.det)); if (!fr.length) return null;
