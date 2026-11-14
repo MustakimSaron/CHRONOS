@@ -168,6 +168,15 @@
     .h3{font-weight:700!important}
     .site-foot{margin:28px auto 22px;padding:14px 18px;max-width:1500px;text-align:center;font-size:12.5px;line-height:1.6;color:#8EA0BD;border-top:1px solid rgba(60,78,120,.45)}
     .site-foot b{color:#C3CEDF;font-weight:600}
+    .cn-row{display:flex;align-items:center;gap:9px;padding:5px 0;font-size:12px;border-top:1px solid rgba(60,78,120,.25)}
+    .cn-row:first-child{border-top:0}
+    .cn-dot{flex:0 0 11px;width:11px;height:11px;border-radius:50%;background:#59657D}
+    .cn-dot.ok{background:#2FD27F;box-shadow:0 0 8px #2FD27F}
+    .cn-dot.busy{background:#F5C76A;box-shadow:0 0 8px #F5C76A;animation:cnpulse 1s ease-in-out infinite}
+    .cn-dot.fail{background:#FF5C6C;box-shadow:0 0 8px #FF5C6C}
+    .cn-name{flex:1;color:#DCE4F2;font-weight:600}
+    .cn-txt{color:#8EA0BD;font-size:11px;text-align:right}
+    @keyframes cnpulse{50%{opacity:.35}}
   </style>
 </head>
 <body>
@@ -278,6 +287,14 @@
           <div style="color:#8EA0BD;">MPC / IRSA MOST Status:</div>
           <div id="mpc-status-text" style="color:#5FD3A6;font-weight:600;margin-top:3px;"></div>
         </div>
+      </div>
+
+      <div class="glass-card" id="conn-panel">
+        <div class="row" style="margin-bottom:6px;">
+          <span style="font-size:12px;font-weight:700;color:#C3CEDF;">Data connections</span>
+          <span style="font-size:10px;color:#8EA0BD;">green = connected · yellow = working · red = failed</span>
+        </div>
+        <div id="conn-rows"></div>
       </div>
 
       <div class="glass-card">
@@ -719,20 +736,46 @@
         } catch (e) { }
       }
     }
+    // ---------------- live data-connection panel ----------------
+    const CONN = [["name", "Object name search"], ["gaia", "ESA Gaia DR3 stars"], ["wise", "AllWISE catalogue"], ["img", "Survey image"], ["spx", "NASA SPHEREx real data"], ["jpl", "JPL known objects"], ["neo", "NEOWISE + CatWISE"]];
+    const CONN_STRICT = { spx: 1, jpl: 1, neo: 1 }; // any failure shows red
+    const connS = {}; CONN.forEach(([k]) => connS[k] = { n: 0, ok: 0, bad: 0, okNote: "", badNote: "" });
+    function connKey(u) { u = String(u); if (/nph-sesame|\/api\/resolve|simbad/i.test(u)) return "name"; if (/what=gaia|gea\.esac|tapvizier/i.test(u)) return "gaia"; if (/what=wise/.test(u)) return "wise"; if (/\/api\/spherex\/(field|spectrum)/.test(u)) return "spx"; if (/\/api\/known-objects/.test(u)) return "jpl"; if (/\/api\/xmatch/.test(u)) return "neo"; return null; }
+    function connBegin(k) { if (k) { connS[k].n++; connRender(); } }
+    function connEnd(k, ok, note) { if (!k) return; const s = connS[k]; s.n = Math.max(0, s.n - 1); if (ok === true) { s.ok++; s.okNote = note || ""; } else if (ok === false) { s.bad++; s.badNote = note || ""; } connRender(); }
+    function connReset(k) { const s = connS[k]; if (s) { s.n = 0; s.ok = 0; s.bad = 0; s.okNote = ""; s.badNote = ""; connRender(); } }
+    const connShort = m => /time|50[234]|abort|no answer/i.test(String(m)) ? "no answer in time" : /Failed to fetch|NetworkError|CORS/i.test(String(m)) ? "blocked / unreachable" : (String(m).replace(/https?:\/\/\S+/g, "").slice(0, 60) || "failed");
+    const CONN_RETRY = { spx: () => { realKey = null; ensureRealField(); }, jpl: () => { knownKey = null; checkKnownObjects(false); }, neo: () => crossCheckWISE() };
+    function connRender() {
+      const box = document.getElementById("conn-rows"); if (!box) return;
+      box.innerHTML = CONN.map(([k, label]) => {
+        const s = connS[k]; let st, txt;
+        if (k === "img") { const v = typeof sv !== "undefined" ? sv.state : null; st = v === "loading" ? "busy" : v === "ok" ? "ok" : v ? "fail" : "idle"; txt = { busy: "loading…", ok: "loaded", fail: "not available", idle: "waiting" }[st]; }
+        else { st = s.n > 0 ? "busy" : (CONN_STRICT[k] && s.bad > 0) ? "fail" : s.ok > 0 ? "ok" : s.bad > 0 ? "fail" : "idle";
+          txt = st === "busy" ? "working… (can take a minute or two)" : st === "ok" ? (s.okNote || "connected") : st === "fail" ? (s.badNote || "failed") : "not used yet"; }
+        const retry = st === "fail" && CONN_RETRY[k] ? ` · <a href="#" data-cn="${k}" style="color:#7FA8FF">retry</a>` : "";
+        return `<div class="cn-row"><span class="cn-dot ${st}"></span><span class="cn-name">${label}</span><span class="cn-txt">${txt}${retry}</span></div>`;
+      }).join("");
+    }
+    document.addEventListener("click", e => { const a = e.target.closest && e.target.closest("[data-cn]"); if (a) { e.preventDefault(); const f = CONN_RETRY[a.dataset.cn]; if (f) f(); } });
+    setInterval(connRender, 1500); document.addEventListener("DOMContentLoaded", connRender);
+
     async function fetchJSON(url, ms = 5000, ext) {
-      if (!DEMO.rec) { const d = demoGet(url); if (d !== undefined) { const o = structuredClone(d); if (o && typeof o === "object" && !Array.isArray(o)) { o.cached = true; o.demo = true; } return o; } }
+      const ck = connKey(url); connBegin(ck);
+      if (!DEMO.rec) { const d = demoGet(url); if (d !== undefined) { const o = structuredClone(d); if (o && typeof o === "object" && !Array.isArray(o)) { o.cached = true; o.demo = true; } connEnd(ck, true, "saved NASA data"); return o; } }
       const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
       if (ext) { if (ext.aborted) c.abort(); else ext.addEventListener("abort", () => c.abort()); }
       try { const r = await fetch(url, { signal: c.signal });
         if (!r.ok) { let d = ""; try { const j = await r.json(); d = j && j.detail ? String(j.detail) : ""; } catch (e) { } throw new Error("HTTP " + r.status + (d ? " - " + d.slice(0, 220) : "")); }
-        const j = await r.json(); if (DEMO.rec) { const k = demoKey(url); if (k) DEMO.rec[k] = j; } return j; }
-      catch (e) { if (e && e.name === "AbortError") { const err = new Error(ext && ext.aborted ? "cancelled (a newer request replaced it)" : `no answer within ${Math.round(ms / 1000)} s`); err.name = "AbortError"; throw err; } throw e; }
+        const j = await r.json(); connEnd(ck, true, /\/api\//.test(url) ? "via server" : "direct"); if (DEMO.rec) { const k = demoKey(url); if (k) DEMO.rec[k] = j; } return j; }
+      catch (e) { connEnd(ck, (ext && ext.aborted) ? null : false, connShort(e && e.message)); if (e && e.name === "AbortError") { const err = new Error(ext && ext.aborted ? "cancelled (a newer request replaced it)" : `no answer within ${Math.round(ms / 1000)} s`); err.name = "AbortError"; throw err; } throw e; }
       finally { clearTimeout(t); }
     }
     async function fetchText(url, ms = 5000) {
+      const ck = connKey(url); connBegin(ck);
       const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
-      try { const r = await fetch(url, { signal: c.signal }); if (!r.ok) throw new Error("HTTP " + r.status); return await r.text(); }
-      catch (e) { if (e && e.name === "AbortError") { const err = new Error(`no answer within ${Math.round(ms / 1000)} s`); err.name = "AbortError"; throw err; } throw e; }
+      try { const r = await fetch(url, { signal: c.signal }); if (!r.ok) throw new Error("HTTP " + r.status); const tx = await r.text(); connEnd(ck, true, "CDS Sesame"); return tx; }
+      catch (e) { connEnd(ck, false, connShort(e && e.message)); if (e && e.name === "AbortError") { const err = new Error(`no answer within ${Math.round(ms / 1000)} s`); err.name = "AbortError"; throw err; } throw e; }
       finally { clearTimeout(t); }
     }
     const tapURL = (base, adql) => base + "?" + new URLSearchParams({ REQUEST: "doQuery", LANG: "ADQL", FORMAT: "json", QUERY: adql }).toString();
@@ -741,7 +784,7 @@
     let backendAlive = (typeof location !== "undefined") && /^https?:$/.test(location.protocol); // checked at start-up: if /api does not answer, the page talks to the archives directly
     let fieldCtl = null; // cancels the previous field's archive requests when the user moves on (frees browser connections)
     async function fetchField(ra, dec, fov) {
-      if (fieldCtl) fieldCtl.abort(); const ctl = fieldCtl = new AbortController();
+      if (fieldCtl) fieldCtl.abort(); const ctl = fieldCtl = new AbortController(); connReset("gaia"); connReset("wise");
       const rad = Math.min(Math.max(fov * 0.72 / 60, 0.02), 0.5).toFixed(4);
       const F = { key: `${ra.toFixed(5)}|${dec.toFixed(5)}|${fov}`, gaia: [], wise: [], gaiaSrc: null, wiseSrc: null, synthetic: false };
       const circ = (r, d) => `1=CONTAINS(POINT('ICRS',${r},${d}),CIRCLE('ICRS',${ra.toFixed(6)},${dec.toFixed(6)},${rad}))`;
@@ -1007,7 +1050,7 @@
     async function slewFromInputs() {
       const name = $("input-name").value.trim();
       if (name) {
-        setStatus(`Resolving “${name}” via CDS Sesame / SIMBAD…`);
+        connReset("name"); setStatus(`Resolving “${name}” via CDS Sesame / SIMBAD…`);
         const r = await resolveName(name);
         if (!r) { setStatus(`Could not resolve “${name}” (offline or unknown). Try coordinates.`, false); return; }
         $("input-ra").value = degToHMS(r.ra); $("input-dec").value = degToDMS(r.dec); $("input-name").value = "";
@@ -1731,7 +1774,7 @@
       if (dataMode !== "real" || !model || !apiUp()) { realNotice(); return; }
       const key = `${model.ra.toFixed(5)}|${model.dec.toFixed(5)}|${model.fov}`;
       if (key === realKey) { realNotice(); return; }
-      realKey = key; realField = null; realState = "loading"; realNotice();
+      realKey = key; realField = null; realState = "loading"; connReset("spx"); realNotice();
       const myKey = key, t0 = performance.now();
       fetchJSON(`${backendBase()}/api/spherex/field?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}`, 240000)
         .then(j => {
@@ -1872,9 +1915,9 @@
       if (!apiUp()) { el.innerHTML = "Needs the CHRONOS-102 server (JPL does not allow direct browser requests)."; return; }
       const mjd = realReady() && realField.epochs_mjd ? (realField.epochs_mjd[1] || realField.epochs_mjd[0]) : null;
       const key = `${model.ra.toFixed(4)}|${model.dec.toFixed(4)}|${model.fov}|${mjd || "now"}`; if (key === knownKey && knownObjs) { if (!quiet) renderKnown(); return; }
-      el.innerHTML = `Asking JPL which known asteroids and comets were in this field on ${mjd ? fmtMJD(mjd) : "today"}…`;
+      connReset("jpl"); el.innerHTML = `Asking JPL which known asteroids and comets were in this field on ${mjd ? fmtMJD(mjd) : "today"}… (this can take a minute or two)`;
       try {
-        const j = await fetchJSON(`${backendBase()}/api/known-objects?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}${mjd ? "&mjd=" + mjd : ""}`, 60000);
+        const j = await fetchJSON(`${backendBase()}/api/known-objects?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}${mjd ? "&mjd=" + mjd : ""}`, 170000);
         knownKey = key; knownObjs = j.objects.map(o => ({ ...o, x: N / 2 - (o.dra_arcsec || 0) / model.scale, y: N / 2 - (o.ddec_arcsec || 0) / model.scale }));
         logLine("OK  ", `JPL known objects: ${knownObjs.length} in field (${j.source})`); renderKnown(); markKnownInScan(); drawHud();
       } catch (e) { el.innerHTML = "JPL check: " + escH(slowMsg(e && e.name === "AbortError" ? "timeout" : e.message)) + (/SSLError|CERTIFICATE/i.test(e.message) ? `<br><b style="color:#F5C76A">A VPN or proxy on this network is intercepting HTTPS requests to JPL.</b>` : ""); logLine("WARN", "JPL known objects: " + (e && e.name === "AbortError" ? "JPL did not answer within 60 s - press “Check known objects” to try again" : e.message)); }
@@ -2185,9 +2228,9 @@
       const el = $("xm-result"); if (!model) return;
       if (!apiUp()) { el.innerHTML = "The NEOWISE + CatWISE check needs the CHRONOS-102 data server (IRSA does not answer browsers directly)."; return; }
       const T = xmTarget(), muM = T.r ? T.r.mu : 0, rad = Math.min(300, Math.max(muM ? 45 : 90, T.sep + 40, muM * 12 + 30)), ra = T.s0 ? (T.s0.ra + T.s1.ra) / 2 : T.s1.ra, dec = T.s0 ? (T.s0.dec + T.s1.dec) / 2 : T.s1.dec;
-      const tok = ++xmToken;
+      const tok = ++xmToken; connReset("neo");
       el.innerHTML = `Step 1/2 · CatWISE2020 proper motions within ${rad.toFixed(0)}″ of ${degToHMS(ra)} ${degToDMS(dec)}…`;
-      let j; try { j = await fetchJSON(`${backendBase()}/api/xmatch?mode=catwise&ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=${rad.toFixed(0)}`, 100000); }
+      let j; try { j = await fetchJSON(`${backendBase()}/api/xmatch?mode=catwise&ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=${rad.toFixed(0)}`, 170000); }
       catch (e) { if (tok !== xmToken) return; el.innerHTML = `<span style="color:#F5C76A">IRSA check: ${escH(slowMsg(e.message))}</span>`; logLine("WARN", "NEOWISE/CatWISE cross-check: " + e.message); return; }
       if (tok !== xmToken) return;
       const cosd = Math.cos(dec * D2R), off = (r_, d_) => [(r_ - ra) * cosd * 3600, (d_ - dec) * 3600]; // +x = east
@@ -2209,7 +2252,7 @@
       el.innerHTML = `Step 2/2 · NEOWISE exposures 2013–2024 along the expected track${best ? ` of CatWISE ${escH(best.name)}` : ""}…`;
       const sRa = ra + seed.x / 3600 / cosd, sDec = dec + seed.y / 3600, fast = Math.hypot(seed.vx, seed.vy) > 40; // >40″/yr: a solar-system body, no fixed track
       let jn = { neowise: [], errors: [] };
-      if (!fast) try { jn = await fetchJSON(`${backendBase()}/api/xmatch?mode=neowise&ra=${sRa.toFixed(6)}&dec=${sDec.toFixed(6)}&radius=${rad.toFixed(0)}&pmra=${seed.vx.toFixed(4)}&pmdec=${seed.vy.toFixed(4)}&t0=${tSph.toFixed(3)}`, 130000); }
+      if (!fast) try { jn = await fetchJSON(`${backendBase()}/api/xmatch?mode=neowise&ra=${sRa.toFixed(6)}&dec=${sDec.toFixed(6)}&radius=${rad.toFixed(0)}&pmra=${seed.vx.toFixed(4)}&pmdec=${seed.vy.toFixed(4)}&t0=${tSph.toFixed(3)}`, 200000); }
         catch (e) { jn = { neowise: [], errors: ["NEOWISE-R: " + e.message] }; }
       if (tok !== xmToken) return;
       j.neowise = jn.neowise || []; j.errors = (j.errors || []).concat(jn.errors || []); if (jn.neowise_truncated) j.errors.push("NEOWISE result truncated at 5000 rows");
