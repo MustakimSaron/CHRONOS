@@ -985,7 +985,7 @@
     let frames = null, rgbFrames = null, snrInfo = { snr: 0, sigma: 1, peak: 0 }, ruler = { p0: null, p1: null }, inspectPt = null;
     let activeSpec = null, activeClass = null, scanResults = [], curtainX = 0.5, obsToken = 0, drawKindCache = {};
     let localLedger = [
-      { id: "CAND-001", ra: 133.7951, dec: -7.2451, snr: 19.4, velocity_arcsec_yr: 8.12, classification: "Y-Dwarf (Methane + Water Ice Signature)", status: "Verified Benchmark (WISE 0855)", discoverer: "Agent (NSU Physics)" },
+      { id: "CAND-001", ra: 133.7951, dec: -7.2451, snr: 19.4, velocity_arcsec_yr: 8.12, classification: "Y-Dwarf (Methane + Water Ice Signature)", status: "Verified Benchmark (WISE 0855)", discoverer: "ProximaZZZ Team" },
       { id: "CAND-002", ra: 64.5921, dec: 14.2023, snr: 9.8, velocity_arcsec_yr: 9.82, classification: "Helio-Ranged Outer Solar System Candidate (~420 AU)", status: "MPC ADES Ready", discoverer: "Global Citizen Node #42" } ];
     const offA = document.createElement("canvas"), offB = document.createElement("canvas"); offA.width = offA.height = offB.width = offB.height = N;
 
@@ -1260,7 +1260,7 @@
     }
     async function syncIRSA(manual) {
       const el = $("irsa-sync"); el.innerText = "checking IRSA TAP for SPHEREx tables…";
-      const now = new Date().toISOString().slice(0, 19).replace("T", " ") + " UTC";
+      const now = "just now";
       try {
         let rows, rels = [];
         if (backendAlive) { const jr = await fetchJSON(`${backendBase()}/api/irsa-releases`, 90000); rows = jr.tables; rels = jr.releases || []; }
@@ -1748,7 +1748,7 @@
           logLine("OK  ", `Real SPHEREx: ${j.frames.length} exposures (D${[...new Set(j.frames.map(f => f.det))].join(",D")}) of ${j.n_available} available, visits ${fmtMJD(j.epochs_mjd[0])} and ${fmtMJD(j.epochs_mjd[1])}${j.cached ? " (cached)" : ""} in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
           updateAll(true);
         })
-        .catch(e => { if (myKey !== realKey) return; realState = "error"; realErr = "Could not load real SPHEREx data: " + e.message + ". The simulated field is shown instead."; logLine("WARN", realErr); realNotice(); updateAll(false); });
+        .catch(e => { if (myKey !== realKey) return; realState = "error"; realErr = (/50[234]|timeout|abort|Proxy|fetch/i.test(String(e && (e.message || e.name))) ? "NASA’s IRSA archive did not answer in time (it is busy or slow right now). Press “Real SPHEREx data” again in a minute." : "Real SPHEREx data could not be loaded for this position.") + " The simulated field is shown instead."; logLine("WARN", realErr); realNotice(); updateAll(false); });
     }
     function realStack(dets, ep) {
       const fr = realField.frames.filter(f => f.epoch === ep && dets.includes(f.det)); if (!fr.length) return null;
