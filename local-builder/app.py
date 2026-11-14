@@ -201,8 +201,17 @@ UA = {"User-Agent": "CHRONOS-102 (SPHEREx citizen-science tool)"}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SITE_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "website"))   # the folder that is published
 DEMO_DIR = os.path.join(SITE_DIR, "demo")
-CACHE_DIR = os.environ.get("CHRONOS_CACHE_DIR") or os.path.join(BASE_DIR, "cache")
-DATA_DIR = os.environ.get("CHRONOS_DATA_DIR") or os.path.join(BASE_DIR, "data")
+ON_VERCEL = bool(os.environ.get("VERCEL"))   # the hosted site runs this file as a serverless function (read-only disk except /tmp)
+CACHE_DIR = os.environ.get("CHRONOS_CACHE_DIR") or ("/tmp/chronos_cache" if ON_VERCEL else os.path.join(BASE_DIR, "cache"))
+DATA_DIR = os.environ.get("CHRONOS_DATA_DIR") or ("/tmp/chronos_data" if ON_VERCEL else os.path.join(BASE_DIR, "data"))
+
+
+def _local_only():
+    """Builder and shared-ledger endpoints only exist on the builder's own computer."""
+    if ON_VERCEL:
+        raise HTTPException(status_code=404, detail="not available on the hosted site")
+
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 # Only for networks that re-sign HTTPS (some VPNs): set CHRONOS_NO_VERIFY=1 before starting. Public data only.
@@ -983,11 +992,13 @@ class Vote(BaseModel):
 
 @app.get("/api/ledger")
 def get_discovery_ledger():
+    _local_only()
     return {"ledger": LEDGER.list(), "storage": LEDGER.storage_info()}
 
 
 @app.post("/api/ledger")
 def submit_to_ledger(sub: CandidateSubmission, request: Request):
+    _local_only()
     try:
         entry = LEDGER.submit(sub.dict(), _client_ip(request))
     except LEDGER_MOD.LedgerError as exc:
@@ -997,6 +1008,7 @@ def submit_to_ledger(sub: CandidateSubmission, request: Request):
 
 @app.post("/api/ledger/{cand_id}/vote")
 def vote_on_candidate(cand_id: str, v: Vote, request: Request):
+    _local_only()
     try:
         entry = LEDGER.vote(cand_id, v.vote, v.voter, _client_ip(request))
     except LEDGER_MOD.LedgerError as exc:
@@ -1127,6 +1139,7 @@ def _clean_text(s: str) -> str:
 
 @app.post("/api/demo/save")
 async def demo_save(request: Request):
+    _local_only()
     """Writes one demo pack into website/demo/. Written to a temporary file first, checked, then swapped in,
     so an existing good pack is never lost."""
     body = await request.json()
@@ -1150,6 +1163,7 @@ async def demo_save(request: Request):
 
 @app.post("/api/demo/finish")
 async def demo_finish(request: Request):
+    _local_only()
     """Called by the builder at the end: re-reads every saved file, writes manifest.json, reports the result."""
     body = await request.json()
     files, problems = [], []
@@ -1182,6 +1196,7 @@ async def demo_finish(request: Request):
 
 @app.get("/api/demo/state")
 def demo_state():
+    _local_only()
     return DEMO_STATE
 
 
@@ -1334,6 +1349,7 @@ def serve_builder():
     return FileResponse(os.path.join(BASE_DIR, "builder.js"), media_type="application/javascript", headers=_NOSTORE)
 
 
-os.makedirs(DEMO_DIR, exist_ok=True)
-app.mount("/demo", StaticFiles(directory=DEMO_DIR), name="demo")
+if not ON_VERCEL:
+    os.makedirs(DEMO_DIR, exist_ok=True)
+    app.mount("/demo", StaticFiles(directory=DEMO_DIR), name="demo")
 
