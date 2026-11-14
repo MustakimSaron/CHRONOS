@@ -1,0 +1,67 @@
+{
+ "files": [
+  {
+   "name": "global",
+   "file": "global.json",
+   "label": "Sky coverage",
+   "ra": null,
+   "dec": null,
+   "fov": null,
+   "bytes": 72240
+  },
+  {
+   "name": "barnards_star",
+   "file": "barnards_star.json",
+   "label": "Barnard's Star",
+   "ra": 269.452075,
+   "dec": 4.693364,
+   "fov": 6.56,
+   "bytes": 1134122
+  },
+  {
+   "name": "eps_indi_b",
+   "file": "eps_indi_b.json",
+   "label": "\u03b5 Indi Ba/Bb",
+   "ra": 331.043833,
+   "dec": -56.782694,
+   "fov": 6.56,
+   "bytes": 644238
+  },
+  {
+   "name": "planet_x_cand",
+   "file": "planet_x_cand.json",
+   "label": "Planet X demo",
+   "ra": 64.592083,
+   "dec": 14.202333,
+   "fov": 6.56,
+   "bytes": 672829
+  },
+  {
+   "name": "r_draconis",
+   "file": "r_draconis.json",
+   "label": "R Draconis",
+   "ra": 248.167625,
+   "dec": 66.754972,
+   "fov": 6.56,
+   "bytes": 1234578
+  },
+  {
+   "name": "rw_aurigae",
+   "file": "rw_aurigae.json",
+   "label": "RW Aurigae",
+   "ra": 76.9565,
+   "dec": 30.401417,
+   "fov": 6.56,
+   "bytes": 625647
+  },
+  {
+   "name": "wise_0855",
+   "file": "wise_0855.json",
+   "label": "WISE 0855",
+   "ra": 133.795129,
+   "dec": -7.245147,
+   "fov": 6.56,
+   "bytes": 1021705
+  }
+ ]
+}
