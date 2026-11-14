@@ -225,7 +225,7 @@ if not VERIFY:
 
 
 _DEAD: Dict[str, float] = {}  # host -> time it last timed out (skip it for 5 minutes so requests fail fast)
-DEAD_SECONDS = 300
+DEAD_SECONDS = 0 if ON_VERCEL else 300   # on the hosted site every press tries again; on a home computer a dead host is skipped for 5 min
 
 
 def _host(url: str) -> str:
@@ -258,7 +258,7 @@ def _get_raw(url, params=None, timeout=20.0, retries=1, headers_extra=None, **kw
     last = None
     for i in range(retries + 1):
         try:
-            r = _SESSION.get(url, params=params, timeout=timeout, headers=dict(UA, **(headers_extra or {})), verify=VERIFY, **kw)
+            r = _SESSION.get(url, params=params, timeout=(min(8.0, timeout), timeout), headers=dict(UA, **(headers_extra or {})), verify=VERIFY, **kw)
             if r.status_code in (502, 503, 504) and i < retries:
                 time.sleep(2.0 * (i + 1))
                 continue
@@ -1042,6 +1042,23 @@ def _sexa(v: float, hours: bool) -> str:
     x = abs(x)
     d = int(x); m = int((x - d) * 60); s = ((x - d) * 60 - m) * 60
     return f"{sign}{d:02d}-{m:02d}-{s:05.2f}"
+
+
+@app.get("/api/net-check")
+def net_check():
+    """Shows which archives this server can reach right now (name, HTTP status, milliseconds)."""
+    out = {"region": os.environ.get("VERCEL_REGION", "local"), "archives": {}}
+    for name, url in (("NASA IRSA", "https://irsa.ipac.caltech.edu/TAP/availability"),
+                      ("NASA JPL", "https://ssd-api.jpl.nasa.gov/sbdb.api?sstr=Ceres"),
+                      ("ESA Gaia", "https://gea.esac.esa.int/tap-server/tap/availability"),
+                      ("CDS Sesame", "https://cds.unistra.fr/cgi-bin/nph-sesame/-oI/A?m42")):
+        t0 = time.time()
+        try:
+            r = requests.get(url, timeout=(8, 15), headers=UA, verify=VERIFY)
+            out["archives"][name] = {"ok": r.status_code == 200, "http": r.status_code, "ms": int((time.time() - t0) * 1000)}
+        except Exception as exc:  # noqa: BLE001
+            out["archives"][name] = {"ok": False, "error": type(exc).__name__, "ms": int((time.time() - t0) * 1000)}
+    return out
 
 
 @app.get("/api/known-objects")
