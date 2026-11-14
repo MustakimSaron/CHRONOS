@@ -15,7 +15,7 @@ import sys
 import time
 import threading
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import requests
@@ -267,6 +267,26 @@ def _get_raw(url, params=None, timeout=20.0, retries=1, headers_extra=None, **kw
             last = exc
             if i < retries:
                 time.sleep(1.5)
+                continue
+            raise
+    raise last
+
+
+def _post(url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw):
+    """POST using the shared HTTP session; used for IRSA asynchronous TAP job submission."""
+    last = None
+    for i in range(retries + 1):
+        try:
+            r = _SESSION.post(url, data=data, timeout=(min(8.0, timeout), timeout),
+                              headers=dict(UA, **(headers_extra or {})), verify=VERIFY, **kw)
+            if r.status_code in (502, 503, 504) and i < retries:
+                time.sleep(2.0 * (i + 1))
+                continue
+            return r
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = exc
+            if i < retries:
+                time.sleep(1.5 * (i + 1))
                 continue
             raise
     raise last
@@ -963,7 +983,12 @@ def irsa_releases():
 import ledger as LEDGER_MOD  # shared, persistent, vote-based ledger (ledger.py)
 import spherex_real as SPX      # real SPHEREx pixels and spectra (spherex_real.py)
 
-SPX.configure(lambda url, params=None, timeout=20.0, retries=1, headers_extra=None: _get(url, params, timeout, retries, headers_extra=headers_extra))
+SPX.configure(
+    lambda url, params=None, timeout=20.0, retries=1, headers_extra=None: _get(url, params, timeout, retries, headers_extra=headers_extra),
+    lambda url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw: _post(
+        url, data, timeout, retries, headers_extra=headers_extra, **kw
+    ),
+)
 LEDGER = LEDGER_MOD.Ledger(os.path.join(DATA_DIR, "ledger.json"), seed=DISCOVERY_LEDGER)
 
 
@@ -1022,8 +1047,12 @@ def spherex_field(ra: float = Query(...), dec: float = Query(...), fov: float = 
     """Real SPHEREx two-visit images (IMAGE - ZODI) for each detector, resampled to the 64x64 viewer grid."""
     try:
         return JSONResponse(content=SPX.field(ra, dec, min(max(fov, 1.0), 30.0), CACHE_DIR))
+    except requests.Timeout as exc:
+        raise HTTPException(status_code=504, detail=f"SPHEREx archive timed out: {type(exc).__name__}: {str(exc)[:200]}")
+    except requests.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"SPHEREx archive temporarily unreachable: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SPHEREx archive: {type(exc).__name__}: {str(exc)[:200]}")
+        raise HTTPException(status_code=502, detail=f"SPHEREx archive/query error: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 @app.get("/api/spherex/spectrum")
@@ -1031,8 +1060,12 @@ def spherex_spectrum(ra: float = Query(...), dec: float = Query(...), n: int = Q
     """Real SPHEREx spectrum at a position from up to n exposures (byte-range reads, a few kB per exposure)."""
     try:
         return JSONResponse(content=SPX.spectrum(ra, dec, CACHE_DIR, max_images=min(max(n, 6), 200)))
+    except requests.Timeout as exc:
+        raise HTTPException(status_code=504, detail=f"SPHEREx archive timed out: {type(exc).__name__}: {str(exc)[:200]}")
+    except requests.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"SPHEREx archive temporarily unreachable: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SPHEREx archive: {type(exc).__name__}: {str(exc)[:200]}")
+        raise HTTPException(status_code=502, detail=f"SPHEREx archive/query error: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 # ---------------- known small bodies (JPL) ----------------
@@ -1281,15 +1314,23 @@ def spherex_coverage_point(ra: float = Query(...), dec: float = Query(...)):
 @app.get("/api/xmatch")
 def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: float = Query(45.0, ge=5, le=300),
                        mode: str = Query("both"), pmra: float = Query(0.0), pmdec: float = Query(0.0), t0: float = Query(2025.9)):
-    """CatWISE2020 (proper motions, epoch ~2015.4) and NEOWISE-R single exposures (2013-2024).
-    NEOWISE is searched in a narrow corridor along the expected track (ra, dec at epoch t0 moving with pmra, pmdec in arcsec/yr),
-    or in a small circle when no motion is given, so a dense field never hits the row limit."""
+    """CatWISE2020 and NEOWISE-R queries. Wait for every selected IRSA request to finish;
+    never turn a still-running worker into a successful empty result."""
+    # xmatch3 intentionally bypasses old xmatch2 entries, which may have been written after
+    # the former 130-second thread join returned before the 140/150-second TAP requests ended.
     key = f"{ra:.5f}|{dec:.5f}|{radius:.0f}|{mode}|{pmra:.3f}|{pmdec:.3f}|{t0:.2f}"
-    hit = _cache_load_any("xmatch2", key)
+    hit = _cache_load_any("xmatch3", key)
     if hit is not None:
         return hit
     cosd = max(1e-6, math.cos(math.radians(dec)))
     out = {"ra": ra, "dec": dec, "radius_arcsec": radius, "catwise": [], "neowise": [], "errors": [], "neowise_region": None}
+    failures = []
+
+    def record_failure(service, exc):
+        # Lists are append-safe across the two worker threads; the main thread reads them
+        # only after all futures have completed.
+        failures.append((service, exc))
+        out["errors"].append(f"{service}: {type(exc).__name__}: {str(exc)[:180]}")
 
     def cat():
         circ = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{radius / 3600.0:.6f})"
@@ -1297,9 +1338,9 @@ def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: 
             rows = _tap_csv(IRSA_TAP, "SELECT TOP 500 source_name, ra, dec, w1mpro, w2mpro, pmra, pmdec, sigpmra, sigpmdec FROM catwise_2020 "
                                       f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {circ})", 140)
             out["catwise"] = [{"name": r[0], "ra": _f(r[1]), "dec": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4]),
-                               "pmra": _f(r[5]), "pmdec": _f(r[6]), "e_pmra": _f(r[7]), "e_pmdec": _f(r[8])} for r in rows]
+                               "pmra": _f(r[5]), "pmdec": _f(r[6]), "e_pmra": _f(r[7]), "e_pmdec": _f(r[8])} for r in rows if len(r) >= 9]
         except Exception as exc:
-            out["errors"].append(f"CatWISE2020: {type(exc).__name__}: {str(exc)[:140]}")
+            record_failure("CatWISE2020", exc)
 
     def neo():
         mu = math.hypot(pmra, pmdec)
@@ -1317,25 +1358,54 @@ def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: 
             region = "POLYGON('ICRS'," + ",".join(f"{p[0] % 360:.6f},{p[1]:.6f}" for p in pts) + ")"
             out["neowise_region"] = {"kind": "corridor", "half_width_arcsec": 12}
         else:
+            # Preserve the existing 25-arcsec static-source search region.
             region = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{min(radius, 25.0) / 3600.0:.6f})"
             out["neowise_region"] = {"kind": "circle", "radius_arcsec": min(radius, 25.0)}
         try:
             rows = _tap_csv(IRSA_TAP, "SELECT TOP 5000 ra, dec, mjd, w1mpro, w2mpro FROM neowiser_p1bs_psd "
                                       f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {region}) AND w2mpro IS NOT NULL", 150)
-            out["neowise"] = [{"ra": _f(r[0]), "dec": _f(r[1]), "mjd": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4])} for r in rows]
+            out["neowise"] = [{"ra": _f(r[0]), "dec": _f(r[1]), "mjd": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4])} for r in rows if len(r) >= 5]
             out["neowise_truncated"] = len(rows) >= 5000
         except Exception as exc:
-            out["errors"].append(f"NEOWISE-R: {type(exc).__name__}: {str(exc)[:140]}")
+            record_failure("NEOWISE-R", exc)
 
     jobs = ([cat] if mode in ("both", "catwise") else []) + ([neo] if mode in ("both", "neowise") else [])
-    th = [threading.Thread(target=f) for f in jobs]
-    [t.start() for t in th]
-    [t.join(130) for t in th]
+    if not jobs:
+        raise HTTPException(status_code=400, detail="mode must be 'both', 'catwise', or 'neowise'")
+
+    # Context-manager shutdown waits for every task. Each TAP request has its own bounded
+    # network timeout (140s/150s), so no worker can be silently abandoned at 130 seconds.
+    with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="irsa-xmatch") as ex:
+        futures = {ex.submit(fn): fn.__name__ for fn in jobs}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:  # defensive: worker functions normally capture their own errors
+                record_failure(futures[future], exc)
+
     out["source"] = "NASA/IPAC IRSA TAP: catwise_2020, neowiser_p1bs_psd"
-    if not out["errors"]:
-        _cache_save_any("xmatch2", key, out)
-    if out["errors"] and not out["catwise"] and not out["neowise"]:
-        raise HTTPException(status_code=502, detail=" | ".join(out["errors"]))
+    out["query_status"] = {
+        "catwise": "error" if any(name == "CatWISE2020" for name, _ in failures) else ("ok" if mode in ("both", "catwise") else "not_requested"),
+        "neowise": "error" if any(name == "NEOWISE-R" for name, _ in failures) else ("ok" if mode in ("both", "neowise") else "not_requested"),
+    }
+
+    # Only cache a complete response. A legitimate completed zero-row query is valid and
+    # cacheable; any failed/timeout service keeps the response uncached for the next retry.
+    if not failures:
+        _cache_save_any("xmatch3", key, out)
+    elif not out["catwise"] and not out["neowise"]:
+        statuses = []
+        for _, exc in failures:
+            if isinstance(exc, requests.Timeout):
+                statuses.append(504)
+            elif isinstance(exc, requests.ConnectionError):
+                statuses.append(503)
+            else:
+                response = getattr(exc, "response", None)
+                upstream_status = getattr(response, "status_code", None)
+                statuses.append(upstream_status if upstream_status in (502, 503, 504) else 502)
+        status = 504 if 504 in statuses else (503 if 503 in statuses else 502)
+        raise HTTPException(status_code=status, detail=" | ".join(out["errors"]))
     return out
 
 
