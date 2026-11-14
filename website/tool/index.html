@@ -1866,6 +1866,7 @@
     };
 
     // ---- JPL known-object check
+    const slowMsg = m => /time|50[234]|Connect|Pool|Proxy|fetch|abort/i.test(String(m)) ? "the archive did not answer in time (busy, or not reachable from the web server). Press the button again in a minute." : String(m).slice(0, 140);
     async function checkKnownObjects(quiet) {
       if (!model) return; const el = $("known-list");
       if (!apiUp()) { el.innerHTML = "Needs the CHRONOS-102 server (JPL does not allow direct browser requests)."; return; }
@@ -1876,7 +1877,7 @@
         const j = await fetchJSON(`${backendBase()}/api/known-objects?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}${mjd ? "&mjd=" + mjd : ""}`, 60000);
         knownKey = key; knownObjs = j.objects.map(o => ({ ...o, x: N / 2 - (o.dra_arcsec || 0) / model.scale, y: N / 2 - (o.ddec_arcsec || 0) / model.scale }));
         logLine("OK  ", `JPL known objects: ${knownObjs.length} in field (${j.source})`); renderKnown(); markKnownInScan(); drawHud();
-      } catch (e) { el.innerHTML = "JPL check failed: " + escH(e && e.name === "AbortError" ? "timeout" : e.message) + (/SSLError|CERTIFICATE/i.test(e.message) ? `<br><b style="color:#F5C76A">A VPN or proxy on this network is intercepting HTTPS requests to JPL.</b>` : ""); logLine("WARN", "JPL known objects: " + (e && e.name === "AbortError" ? "JPL did not answer within 60 s - press “Check known objects” to try again" : e.message)); }
+      } catch (e) { el.innerHTML = "JPL check: " + escH(slowMsg(e && e.name === "AbortError" ? "timeout" : e.message)) + (/SSLError|CERTIFICATE/i.test(e.message) ? `<br><b style="color:#F5C76A">A VPN or proxy on this network is intercepting HTTPS requests to JPL.</b>` : ""); logLine("WARN", "JPL known objects: " + (e && e.name === "AbortError" ? "JPL did not answer within 60 s - press “Check known objects” to try again" : e.message)); }
     }
     function renderKnown() {
       const el = $("known-list"); if (!knownObjs) return;
@@ -2187,7 +2188,7 @@
       const tok = ++xmToken;
       el.innerHTML = `Step 1/2 · CatWISE2020 proper motions within ${rad.toFixed(0)}″ of ${degToHMS(ra)} ${degToDMS(dec)}…`;
       let j; try { j = await fetchJSON(`${backendBase()}/api/xmatch?mode=catwise&ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=${rad.toFixed(0)}`, 100000); }
-      catch (e) { if (tok !== xmToken) return; el.innerHTML = `<span style="color:#F5C76A">IRSA did not answer (${escH(e.message)}). Try again in a minute.</span>`; logLine("WARN", "NEOWISE/CatWISE cross-check: " + e.message); return; }
+      catch (e) { if (tok !== xmToken) return; el.innerHTML = `<span style="color:#F5C76A">IRSA check: ${escH(slowMsg(e.message))}</span>`; logLine("WARN", "NEOWISE/CatWISE cross-check: " + e.message); return; }
       if (tok !== xmToken) return;
       const cosd = Math.cos(dec * D2R), off = (r_, d_) => [(r_ - ra) * cosd * 3600, (d_ - dec) * 3600]; // +x = east
       const tSph = (dataMode === "real" && realField && realField.epochs_mjd) ? 2000 + (realField.epochs_mjd[1] - 51544.5) / 365.25 : 2025.9;
