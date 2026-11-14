@@ -49,6 +49,9 @@
   }
   const waitFor = async (cond, ms, step = 300) => { const end = performance.now() + ms; while (performance.now() < end) { try { if (cond()) return true; } catch (e) { } await sleep(step); } return false; };
 
+  const has = prefix => Object.keys(DEMO.rec || {}).some(k => k.startsWith(prefix));
+  const until = async (fn, prefix, tries = 3) => { for (let i = 0; i < tries; i++) { try { await fn(); } catch (e) { } if (has(prefix)) return true; await sleep(6000); } return false; };
+
   // records one target; returns { pack, note } or null when the recording is not good enough
   async function recordTarget(key, label) {
     DEMO.rec = {};
@@ -59,9 +62,11 @@
     await waitFor(() => Object.keys(DEMO.rec).some(k => k.startsWith("/api/archives?what=wise")), 100000);
     const starsOK = !!(fieldCache && !fieldCache.synthetic && fieldCache.gaia && fieldCache.gaia.length);
     if (!starsOK) { DEMO.rec = null; return null; } // Gaia did not answer: a pack made of synthetic stars would be worthless
-    await checkKnownObjects(false); await coverHere();
-    if (model.tgt && model.tgt.pos && model.tgt.pos.length > 1) { ruler = { p0: model.tgt.pos[0], p1: model.tgt.pos[1] }; updateRuler(); await crossCheckWISE(); }
-    runAIScan(); if (scanResults.length) { selectScan(0); await crossCheckWISE(); }
+    let jplOK = await until(() => checkKnownObjects(false), "/api/known-objects"); await coverHere();
+    let catOK = false;
+    if (model.tgt && model.tgt.pos && model.tgt.pos.length > 1) { ruler = { p0: model.tgt.pos[0], p1: model.tgt.pos[1] }; updateRuler(); catOK = await until(() => crossCheckWISE(), "/api/xmatch?mode=catwise"); }
+    runAIScan();
+    for (let i = 0; i < Math.min(3, scanResults.length); i++) { selectScan(i); catOK = (await until(() => crossCheckWISE(), "/api/xmatch?mode=catwise")) || catOK; } // the three best candidates are saved, not only the first
     ruler = { p0: null, p1: null }; updateRuler();
     let imgs = 0; for (const k of ["wise", "2mass", "dss"]) { setSurvey(k); await waitFor(() => sv.state && sv.state !== "loading", 50000); if (await captureSurvey(k)) imgs++; }
     setSurvey("wise");
@@ -70,18 +75,18 @@
     if (realState === "ready") {
       const deep1 = await waitFor(() => activeSpec && activeSpec.real && activeSpec.deep, 480000, 1000); // full spectrum of the default pixel
       real = `${realField.frames.length} real exposures${deep1 ? ", full spectrum" : ""}`;
-      await checkKnownObjects(false); runAIScan();
-      if (scanResults.length) { selectScan(0); await waitFor(() => activeSpec && activeSpec.real && activeSpec.deep, 300000, 1000); await crossCheckWISE(); }
+      jplOK = (await until(() => checkKnownObjects(false), "/api/known-objects")) || jplOK; runAIScan();
+      for (let i = 0; i < Math.min(3, scanResults.length); i++) { selectScan(i); if (i === 0) await waitFor(() => activeSpec && activeSpec.real && activeSpec.deep, 300000, 1000); catOK = (await until(() => crossCheckWISE(), "/api/xmatch?mode=catwise")) || catOK; }
     }
     setDataMode("sim");
     const rec = DEMO.rec; DEMO.rec = null;
-    return { pack: { label, key, ra: BENCHMARKS[key].ra_deg, dec: BENCHMARKS[key].dec_deg, fov: model.fov, responses: rec }, note: `${fieldCache.gaia.length} stars, ${imgs}/3 survey images, ${real}`, imgs };
+    return { pack: { label, key, ra: BENCHMARKS[key].ra_deg, dec: BENCHMARKS[key].dec_deg, fov: model.fov, responses: rec }, note: `${fieldCache.gaia.length} stars, ${imgs}/3 images, ${real}, JPL ${jplOK ? "✓" : "✕"}, CatWISE ${catOK ? "✓" : "✕"}`, imgs, missing: [!jplOK && "JPL known objects", !catOK && "NEOWISE/CatWISE", realState !== "ready" && "real SPHEREx"].filter(Boolean) };
   }
 
   async function run() {
     if (!isLocalServer()) { $b("bp-now").textContent = "The local data server is not running. Start the builder with Build-Demo-Pack."; return; }
     const keep = { mode: dataMode, view: viewMode, survey: sv.key };
-    const saved = [], failed = []; let bytes = 0;
+    const saved = [], failed = [], incomplete = []; let bytes = 0;
     try {
       $b("bp-now").textContent = "Sky coverage map and data release…";
       DEMO.rec = {}; await loadCoverage(true); await syncIRSA(true);
@@ -99,7 +104,7 @@
         if (res) {
           const r = await saveDemoPack(key, res.pack); bytes += r.bytes; saved.push(key);
           Object.assign(DEMO.map, res.pack.responses); if (!demoField(res.pack.ra, res.pack.dec)) DEMO.fields.push({ name: key, label, ra: res.pack.ra, dec: res.pack.dec, fov: res.pack.fov });
-          setRow(key, "✓", `${label} — ${res.note} (${(r.bytes / 1048576).toFixed(1)} MB)`);
+          setRow(key, res.missing.length ? "◐" : "✓", `${label} — ${res.note} (${(r.bytes / 1048576).toFixed(1)} MB)`); if (res.missing.length) incomplete.push(`${label}: ${res.missing.join(", ")}`);
         } else { failed.push(label); setRow(key, "✕", `${label} — not saved (${why}); an older saved copy, if any, is kept`); }
         progress((i + 2) / (TARGETS.length + 1));
       }
@@ -109,7 +114,7 @@
     const ok = failed.length === 0 && fin && fin.ok;
     $b("bp-now").textContent = ok ? "Finished." : "Finished with problems.";
     $b("bp-end").style.color = ok ? "#7CE0B0" : "#F5C76A";
-    $b("bp-end").textContent = ok ? `All ${saved.length - 1} targets and the sky map are saved (${(bytes / 1048576).toFixed(1)} MB). You can close this window and copy the whole folder to GitHub.`
+    $b("bp-end").textContent = ok ? `All ${saved.length - 1} targets and the sky map are saved (${(bytes / 1048576).toFixed(1)} MB).` + (incomplete.length ? ` Saved without some NASA answers (${incomplete.join(" · ")}). Run the builder again later to fill the gaps, or copy the folder to GitHub as it is.` : " Everything is complete. You can close this window and copy the whole folder to GitHub.")
       : `${failed.join(", ")} could not be saved. Run the builder again (already-saved targets are kept), ideally with a better internet connection.`;
     progress(1);
   }
