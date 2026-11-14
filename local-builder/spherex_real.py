@@ -349,7 +349,7 @@ def list_images(ra: float, dec: float, cache_dir: str) -> List[Dict]:
     q = ("SELECT a.uri, p.time_bounds_lower, p.energy_bandpassname FROM spherex.artifact a "
          "JOIN spherex.plane p ON a.planeid = p.planeid "
          f"WHERE 1 = CONTAINS(POINT('ICRS', {ra:.6f}, {dec:.6f}), p.poly) ORDER BY p.time_bounds_lower")
-    r = _GET(TAP, {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": q}, 90, retries=1)
+    r = _GET(TAP, {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": q}, 150, retries=1)
     r.raise_for_status()
     if r.text.lstrip().startswith("<"):
         raise RuntimeError("IRSA TAP error: " + re.sub(r"\s+", " ", r.text)[:200])
