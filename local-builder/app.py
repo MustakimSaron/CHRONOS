@@ -1079,7 +1079,7 @@ def known_objects(ra: float = Query(...), dec: float = Query(...), fov: float = 
     j, errs = None, []
     for label, obs in observers:
         try:
-            r = _get("https://ssd-api.jpl.nasa.gov/sb_ident.api", {**base, **obs}, 60, retries=1)
+            r = _get("https://ssd-api.jpl.nasa.gov/sb_ident.api", {**base, **obs}, 120, retries=1)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"JPL did not answer from this network ({type(exc).__name__}: {str(exc)[:120]})")
         if r.status_code == 200:
@@ -1295,7 +1295,7 @@ def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: 
         circ = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{radius / 3600.0:.6f})"
         try:
             rows = _tap_csv(IRSA_TAP, "SELECT TOP 500 source_name, ra, dec, w1mpro, w2mpro, pmra, pmdec, sigpmra, sigpmdec FROM catwise_2020 "
-                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {circ})", 70)
+                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {circ})", 140)
             out["catwise"] = [{"name": r[0], "ra": _f(r[1]), "dec": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4]),
                                "pmra": _f(r[5]), "pmdec": _f(r[6]), "e_pmra": _f(r[7]), "e_pmdec": _f(r[8])} for r in rows]
         except Exception as exc:
@@ -1321,7 +1321,7 @@ def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: 
             out["neowise_region"] = {"kind": "circle", "radius_arcsec": min(radius, 25.0)}
         try:
             rows = _tap_csv(IRSA_TAP, "SELECT TOP 5000 ra, dec, mjd, w1mpro, w2mpro FROM neowiser_p1bs_psd "
-                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {region}) AND w2mpro IS NOT NULL", 100)
+                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {region}) AND w2mpro IS NOT NULL", 150)
             out["neowise"] = [{"ra": _f(r[0]), "dec": _f(r[1]), "mjd": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4])} for r in rows]
             out["neowise_truncated"] = len(rows) >= 5000
         except Exception as exc:
