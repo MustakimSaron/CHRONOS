@@ -4,7 +4,7 @@
   "outputDirectory": "website",
   "rewrites": [{ "source": "/api/(.*)", "destination": "/api/index" }],
   "functions": {
-    "api/index.py": { "maxDuration": 60, "includeFiles": "local-builder/**" }
+    "api/index.py": { "maxDuration": 300, "includeFiles": "local-builder/**" }
   },
   "headers": [
     {
