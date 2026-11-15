@@ -3,7 +3,7 @@ Real SPHEREx data access for CHRONOS-102 (no astropy needed).
 
 How it works
 ------------
-1. IRSA TAP (spherex.artifact JOIN spherex.plane) lists every SPHEREx spectral image covering a sky position.
+1. IRSA SIA2 (with the TAP tables as a backup) lists every SPHEREx spectral image covering a sky position.
 2. Instead of downloading whole 70 MB files (or 5 MB cutouts that always carry the full PSF cube), we read only
    the bytes we need with HTTP Range requests: the FITS headers, a small pixel box from IMAGE and ZODI,
    and the tiny WCS-WAVE table at the end of the file.
@@ -25,9 +25,6 @@ import os
 import re
 import time
 import warnings
-from urllib.parse import urljoin
-
-import requests
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -35,7 +32,6 @@ import numpy as np
 
 IRSA = "https://irsa.ipac.caltech.edu/"
 TAP = "https://irsa.ipac.caltech.edu/TAP/sync"
-TAP_ASYNC = "https://irsa.ipac.caltech.edu/TAP/async"
 S3 = "https://nasa-irsa-spherex.s3.amazonaws.com/"
 BLOCK = 2880
 NATIVE_PX = 6.15  # arcsec per SPHEREx pixel
@@ -57,92 +53,13 @@ def _mask_flags(f, img, x0, y0, w, h):
     img[bad] = np.nan
     return img, float(bad.mean())
 
-# HTTP functions are injected by app.py so SPHEREx uses the application's shared session.
+# The HTTP getter is injected by app.py (it carries the proxy/VPN/retry settings).
 _GET: Callable = None  # type: ignore
-_POST: Callable = None  # type: ignore
 
 
-def configure(getter: Callable, poster: Optional[Callable] = None):
-    global _GET, _POST
+def configure(getter: Callable):
+    global _GET
     _GET = getter
-    _POST = poster
-
-
-def _spx_get(url, params=None, timeout=40, retries=1, headers_extra=None):
-    """SPHEREx-only GET retry wrapper; do not change retry policy for other archives."""
-    if _GET is None:
-        raise RuntimeError("SPHEREx HTTP getter is not configured")
-    last = None
-    for attempt in range(retries + 1):
-        try:
-            return _GET(url, params, timeout, retries=1, headers_extra=headers_extra)
-        except requests.Timeout as exc:
-            last = exc
-            if attempt >= retries:
-                raise
-            time.sleep(1.0 * (attempt + 1))
-    raise last
-
-
-def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
-    """Run an IRSA TAP query as a UWS async job and return CSV rows (without header)."""
-    if _POST is None:
-        raise RuntimeError("IRSA asynchronous TAP POST is not configured")
-
-    response = _POST(
-        TAP_ASYNC,
-        data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql},
-        timeout=30,
-        retries=0,
-        allow_redirects=False,
-    )
-    if response.status_code not in (200, 201, 302, 303):
-        response.raise_for_status()
-        raise RuntimeError(f"IRSA async TAP job submission returned HTTP {response.status_code}")
-
-    location = response.headers.get("Location")
-    if not location:
-        raise RuntimeError("IRSA async TAP did not return a job Location header")
-    job_url = urljoin(TAP_ASYNC.rstrip("/") + "/", location)
-    if not job_url.startswith(TAP_ASYNC + "/"):
-        raise RuntimeError("IRSA async TAP returned an unexpected job URL")
-
-    # UWS jobs are created in PENDING state; explicitly start the job.
-    run_response = _POST(job_url + "/phase", data={"PHASE": "RUN"}, timeout=20, retries=0, allow_redirects=False)
-    if run_response.status_code not in (200, 201, 202, 303):
-        run_response.raise_for_status()
-        raise RuntimeError(f"IRSA async TAP could not start job (HTTP {run_response.status_code})")
-
-    deadline = time.monotonic() + timeout
-    phase = "PENDING"
-    while time.monotonic() < deadline:
-        phase_response = _spx_get(job_url + "/phase", timeout=15, retries=1)
-        phase_response.raise_for_status()
-        phase = phase_response.text.strip().upper()
-        if phase == "COMPLETED":
-            break
-        if phase in ("ERROR", "ABORT", "ABORTED"):
-            detail = ""
-            try:
-                err = _spx_get(job_url + "/error", timeout=10, retries=1)
-                detail = re.sub(r"\s+", " ", err.text).strip()[:240]
-            except Exception:
-                pass
-            raise RuntimeError(f"IRSA async TAP job {phase.lower()}: {detail or 'no archive error detail returned'}")
-        if phase not in ("PENDING", "QUEUED", "EXECUTING", "UNKNOWN", "HELD", "SUSPENDED"):
-            raise RuntimeError(f"IRSA async TAP returned unexpected job phase: {phase[:80]}")
-        time.sleep(2.0)
-    else:
-        raise requests.Timeout(f"IRSA async TAP query exceeded {int(timeout)} seconds (last phase: {phase})")
-
-    result = _spx_get(job_url + "/results/result", timeout=45, retries=2)
-    result.raise_for_status()
-    text = result.text.strip()
-    if text.startswith("<"):
-        msgs = [x.strip() for x in re.findall(r"<INFO[^>]*>([^<]*)</INFO>", text, re.S) if x.strip()]
-        raise RuntimeError("IRSA TAP result error: " + (msgs[0] if msgs else re.sub(r"\s+", " ", text)[:240]))
-    rows = list(csv.reader(io.StringIO(text)))
-    return rows[1:] if rows else []
 
 
 # ------------------------------------------------------------------ FITS header parsing
@@ -200,7 +117,7 @@ class Source:
     def read(self, offset: int, length: int) -> bytes:
         if self.blob is not None:
             return self.blob[offset:offset + length]
-        r = _spx_get(self.url, None, 40, retries=2, headers_extra={"Range": f"bytes={offset}-{offset + length - 1}"})
+        r = _GET(self.url, None, 40, retries=1, headers_extra={"Range": f"bytes={offset}-{offset + length - 1}"})
         self.requests += 1
         if r.status_code == 200:
             raise RangeUnsupported(self.url)
@@ -213,7 +130,7 @@ class Source:
         """Last `length` bytes and the file size."""
         if self.blob is not None:
             return self.blob[-length:], len(self.blob)
-        r = _spx_get(self.url, None, 40, retries=2, headers_extra={"Range": f"bytes=-{length}"})
+        r = _GET(self.url, None, 40, retries=1, headers_extra={"Range": f"bytes=-{length}"})
         self.requests += 1
         if r.status_code != 206:
             raise RangeUnsupported(self.url)
@@ -423,37 +340,130 @@ def _rel_rank(rel: str) -> int:
     return (1000 if m and m.group(1) == "dr" else 0) + (int(m.group(2)) if m else -1)
 
 
-def list_images(ra: float, dec: float, cache_dir: str) -> List[Dict]:
-    """All SPHEREx spectral images whose footprint contains (ra, dec), oldest first, de-duplicated across releases."""
-    key = f"v3-async|{ra:.4f}|{dec:.4f}"
-    hit = _cached("list", key, cache_dir, max_age=86400)
-    if hit is not None:
-        return hit
-    # Keep the original sky-footprint and release-deduplication science logic, but run
-    # the potentially broad metadata query as an asynchronous IRSA TAP job. Push the
-    # existing .fits filter into ADQL so non-FITS artifacts are not transferred.
+SIA = "https://irsa.ipac.caltech.edu/SIA"
+SIA_COLLECTIONS = ("spherex_dr1", "spherex_qr3", "spherex_dr1_deep", "spherex_qr3_deep")
+
+
+def _to_mjd(v) -> Optional[float]:
+    v = (v or "").strip()
+    if not v:
+        return None
+    try:
+        x = float(v)
+        return x if 40000 < x < 90000 else None
+    except ValueError:
+        pass
+    try:  # an ISO date-time
+        import datetime as _dt
+        d = _dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return (d.replace(tzinfo=None) - _dt.datetime(1858, 11, 17)).total_seconds() / 86400.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mjd_from_name(uri: str) -> Optional[float]:
+    """Middle of the observing week written in the file name (level2_2025W19_...)."""
+    m = re.search(r"level2_(\d{4})W(\d{2})", uri)
+    if not m:
+        return None
+    import datetime as _dt
+    d = _dt.datetime(int(m.group(1)), 1, 1) + _dt.timedelta(days=(int(m.group(2)) - 1) * 7 + 3.5)
+    return (d - _dt.datetime(1858, 11, 17)).total_seconds() / 86400.0
+
+
+def _sia_items(ra: float, dec: float) -> Optional[List[Dict]]:
+    """Spectral images covering a position from IRSA SIA2 (the quick method). None = the answer could not be read."""
+    params = [("COLLECTION", c) for c in SIA_COLLECTIONS] + [("POS", f"circle {ra:.6f} {dec:.6f} 0.01"), ("RESPONSEFORMAT", "CSV")]
+    r = _GET(SIA, params, 60, retries=2)
+    r.raise_for_status()
+    text = r.text.strip()
+    if not text:
+        return []
+    if text.startswith("<"):
+        raise RuntimeError("IRSA SIA error: " + re.sub(r"\s+", " ", text)[:200])
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        return []
+    out = []
+    for row in rows:
+        low = {str(k).strip().lower(): (v or "").strip() for k, v in row.items() if k}
+        cands = [low.get("access_url", ""), low.get("obs_publisher_did", "")] + list(low.values())
+        path = None
+        for c in cands:
+            m = re.search(r"((?:ibe/data/spherex/)(?:[^\s,\"'?]+?)\.fits)", c) or re.search(r"((?:dr|qr)\d+/level2/[^\s,\"'?]+?\.fits)", c)
+            if m:
+                path = m.group(1)
+                break
+        if not path:
+            continue
+        if not path.startswith("ibe/"):
+            path = "ibe/data/spherex/" + path
+        mjd = None
+        for k in ("t_min", "t_mid", "time_bounds_lower", "t_start"):
+            mjd = _to_mjd(low.get(k, ""))
+            if mjd:
+                break
+        mjd = mjd or _mjd_from_name(path)
+        if not mjd:
+            continue
+        dm = re.search(r"_\d+D(\d)", path)
+        det = int(dm.group(1)) if dm else int(re.sub(r"\D", "", low.get("energy_bandpassname", "") or low.get("instrument_name", "")) or 0)
+        m2 = re.search(r"(level2_[0-9A-Za-z]+_[0-9A-Za-z]+_\d+_\d+D\d)", path)
+        rel = (re.search(r"/((?:dr|qr)\d+)/", path) or [None, ""])[1]
+        out.append({"uri": path, "mjd": mjd, "det": det, "obs": m2.group(1) if m2 else path, "release": rel})
+    return out if out else None
+
+
+def _tap_items(ra: float, dec: float) -> List[Dict]:
+    """Backup: the same list from the IRSA TAP tables (slower, sometimes unavailable)."""
     q = ("SELECT a.uri, p.time_bounds_lower, p.energy_bandpassname FROM spherex.artifact a "
          "JOIN spherex.plane p ON a.planeid = p.planeid "
-         f"WHERE 1 = CONTAINS(POINT('ICRS', {ra:.6f}, {dec:.6f}), p.poly) "
-         "AND a.uri LIKE '%.fits' ORDER BY p.time_bounds_lower")
-    rows = _tap_async_csv(q, timeout=190)
-    seen, out = {}, []
-    for row in rows:
-        if len(row) < 3:
-            continue
-        uri, t, band = row[:3]
+         f"WHERE 1 = CONTAINS(POINT('ICRS', {ra:.6f}, {dec:.6f}), p.poly) ORDER BY p.time_bounds_lower")
+    r = _GET(TAP, {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": q}, 45, retries=1)
+    r.raise_for_status()
+    if r.text.lstrip().startswith("<"):
+        raise RuntimeError("IRSA TAP error: " + re.sub(r"\s+", " ", r.text)[:200])
+    out = []
+    for uri, t, band in list(csv.reader(io.StringIO(r.text)))[1:]:
         if not uri.endswith(".fits"):
             continue
-        m = re.search(r"(level2_[0-9A-Za-z]+_[0-9A-Za-z]+_\d+_\d+D\d)", uri)  # file names look like level2_<year><week>_1B_<id>_<detector>
-        obs = m.group(1) if m else uri
+        m = re.search(r"(level2_[0-9A-Za-z]+_[0-9A-Za-z]+_\d+_\d+D\d)", uri)
         rel = (re.search(r"/((?:dr|qr)\d+)/", uri) or [None, ""])[1]
-        item = {"uri": uri, "mjd": float(t), "det": int(re.sub(r"\D", "", band) or 0), "obs": obs, "release": rel}
+        out.append({"uri": uri, "mjd": float(t), "det": int(re.sub(r"\D", "", band) or 0), "obs": m.group(1) if m else uri, "release": rel})
+    return out
+
+
+def _dedupe(items: List[Dict]) -> List[Dict]:
+    seen, out = {}, []
+    for item in sorted(items, key=lambda i: i["mjd"]):
+        obs, rel = item["obs"], item["release"]
         if obs in seen:  # keep the newest processing release of the same exposure
             if _rel_rank(rel) > _rel_rank(out[seen[obs]]["release"]):
                 out[seen[obs]] = item
             continue
         seen[obs] = len(out)
         out.append(item)
+    return out
+
+
+def list_images(ra: float, dec: float, cache_dir: str) -> List[Dict]:
+    """All SPHEREx spectral images whose footprint contains (ra, dec), oldest first, de-duplicated across releases.
+    IRSA SIA2 answers in seconds; the TAP tables are only a backup."""
+    key = f"v3|{ra:.4f}|{dec:.4f}"
+    hit = _cached("list", key, cache_dir, max_age=86400)
+    if hit is not None:
+        return hit
+    items, sia_err = None, ""
+    try:
+        items = _sia_items(ra, dec)
+    except Exception as exc:  # noqa: BLE001
+        sia_err = f"{type(exc).__name__}: {str(exc)[:110]}"
+    if items is None:
+        try:
+            items = _tap_items(ra, dec)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"IRSA SIA2 ({sia_err or 'answer not readable'}) and TAP ({type(exc).__name__}: {str(exc)[:90]}) both failed")
+    out = _dedupe(items)
     _store("list", key, cache_dir, out)
     return out
 
@@ -478,7 +488,7 @@ def open_file(uri: str) -> Tuple[SpxFile, str]:
 def open_cutout(uri: str, ra: float, dec: float, size_px: int) -> Tuple[SpxFile, str]:
     """Fallback when Range requests are not possible: the IRSA cutout service (whole small MEF, gzip)."""
     url = IRSA + uri.lstrip("/") + f"?center={ra:.6f},{dec:.6f}d&size={max(0.01, size_px * NATIVE_PX / 3600.0):.4f}"
-    r = _spx_get(url, None, 90, retries=2)
+    r = _GET(url, None, 90, retries=1)
     r.raise_for_status()
     blob = r.content
     if blob[:2] == b"\x1f\x8b":
@@ -658,7 +668,7 @@ def field(ra: float, dec: float, fov_arcmin: float, cache_dir: str, n: int = 64)
         e1 = [it for it in first if it["det"] == d][:1]
         e2 = [it for it in later if it["det"] == d][:2]  # two candidates per detector; keep the closest wavelength
         plan += [("E1", it) for it in e1] + [("E2", it) for it in e2]
-    with ThreadPoolExecutor(max_workers=max(1, min(8, len(plan))), thread_name_prefix="spherex-field") as ex:  # bounded exposure downloads
+    with ThreadPoolExecutor(max_workers=max(1, len(plan))) as ex:  # all exposures in one parallel round
         res = list(ex.map(lambda pe: (pe[0],) + job(pe[1]), plan))
     by = {}
     for ep, it, r in res:

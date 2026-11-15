@@ -15,7 +15,7 @@ import sys
 import time
 import threading
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import requests
@@ -272,26 +272,6 @@ def _get_raw(url, params=None, timeout=20.0, retries=1, headers_extra=None, **kw
     raise last
 
 
-def _post(url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw):
-    """POST using the shared HTTP session; used for IRSA asynchronous TAP job submission."""
-    last = None
-    for i in range(retries + 1):
-        try:
-            r = _SESSION.post(url, data=data, timeout=(min(8.0, timeout), timeout),
-                              headers=dict(UA, **(headers_extra or {})), verify=VERIFY, **kw)
-            if r.status_code in (502, 503, 504) and i < retries:
-                time.sleep(2.0 * (i + 1))
-                continue
-            return r
-        except (requests.ConnectionError, requests.Timeout) as exc:
-            last = exc
-            if i < retries:
-                time.sleep(1.5 * (i + 1))
-                continue
-            raise
-    raise last
-
-
 def _cache_path(part: str, ra: float, dec: float, fov: float) -> str:
     key = f"{part}_{ra:.3f}_{dec:.3f}_{fov:.2f}"
     return os.path.join(CACHE_DIR, hashlib.md5(key.encode()).hexdigest()[:16] + ".json")
@@ -331,6 +311,57 @@ def _s3_release_probe() -> str:
     return "releases: " + (", ".join(found) if found else "none listed")
 
 
+IRSA_GATOR = "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query"
+
+
+def _ipac_value(s):
+    s = (s or "").strip()
+    if s == "" or s.lower() in ("null", "nan", "---"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+
+def _ipac_table(text: str) -> List[Dict]:
+    """Reads an IPAC ASCII table (what Gator returns) into a list of dicts."""
+    lines = [ln.rstrip("\r\n") for ln in text.splitlines() if ln.strip()]
+    heads = [ln for ln in lines if ln.lstrip().startswith("|")]
+    data = [ln for ln in lines if not ln.lstrip().startswith("\\") and not ln.lstrip().startswith("|")]
+    if not heads:
+        return []
+    cuts = [i for i, ch in enumerate(heads[0]) if ch == "|"]
+    cols = [heads[0][cuts[i] + 1:cuts[i + 1]].strip() for i in range(len(cuts) - 1)]
+    rows = []
+    for ln in data:
+        pad = ln.ljust(cuts[-1])
+        rows.append({c: _ipac_value(pad[cuts[i] + 1:cuts[i + 1]]) for i, c in enumerate(cols)})
+    return rows
+
+
+def _gator_cone(catalog: str, ra: float, dec: float, radius_arcsec: float, selcols: str, timeout: float = 60.0) -> List[Dict]:
+    """Cone search through IRSA Gator (the same method that answers in a few seconds)."""
+    params = {"catalog": catalog, "spatial": "cone", "objstr": f"{ra:.6f} {dec:.6f}", "radius": f"{radius_arcsec:.3f}",
+              "radunits": "arcsec", "outfmt": 1, "selcols": selcols}
+    r = _get(IRSA_GATOR, params, timeout, 2)
+    r.raise_for_status()
+    head = r.text[:600]
+    if 'stat="ERROR"' in head or head.lstrip().startswith("<"):
+        m = re.search(r'msg="([^"]*)"', head)
+        raise RuntimeError("IRSA Gator: " + (m.group(1) if m else re.sub(r"\s+", " ", head)[:160]))
+    return _ipac_table(r.text)
+
+
+def _sep_arcsec(ra1, dec1, ra2, dec2):
+    dra = ((ra1 - ra2 + 180.0) % 360.0) - 180.0
+    return math.hypot(dra * math.cos(math.radians(0.5 * (dec1 + dec2))) * 3600.0, (dec1 - dec2) * 3600.0)
+
+
+def _flt(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 def _tap_csv(url: str, adql: str, timeout: float = 40.0):
     """CSV TAP query (every TAP service supports it; used for IRSA where JSON replies came back empty). Returns data rows."""
     r = _get(url, {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql}, timeout, retries=2)
@@ -364,10 +395,17 @@ def query_live_archives(ra_deg: float, dec_deg: float, fov_deg: float = 0.10, wh
 
     def do_wise():
         try:
-            rows = _tap_csv("https://irsa.ipac.caltech.edu/TAP/sync",
-                            f"SELECT TOP 60 designation,ra,dec,w1mpro,w2mpro FROM allwise_p3as_psd "
-                            f"WHERE 1=CONTAINS(POINT('ICRS',ra,dec),{circle}) ORDER BY w1mpro ASC", 60)
-            meta["wise_source"] = "IRSA AllWISE TAP (CSV)"
+            try:
+                g = _gator_cone("allwise_p3as_psd", ra_deg, dec_deg, min(radius_deg * 3600.0, 900.0), "designation,ra,dec,w1mpro,w2mpro", 45)
+                g = [x for x in g if _flt(x.get("ra")) is not None and _flt(x.get("dec")) is not None and _flt(x.get("w1mpro")) is not None]
+                g.sort(key=lambda x: x["w1mpro"])
+                rows = [[x.get("designation") or "", x["ra"], x["dec"], x["w1mpro"], "" if x.get("w2mpro") is None else x["w2mpro"]] for x in g[:60]]
+                meta["wise_source"] = "IRSA AllWISE (Gator)"
+            except Exception:  # noqa: BLE001  - backup: the slower TAP service
+                rows = _tap_csv("https://irsa.ipac.caltech.edu/TAP/sync",
+                                f"SELECT TOP 60 designation,ra,dec,w1mpro,w2mpro FROM allwise_p3as_psd "
+                                f"WHERE 1=CONTAINS(POINT('ICRS',ra,dec),{circle}) ORDER BY w1mpro ASC", 40)
+                meta["wise_source"] = "IRSA AllWISE TAP (CSV)"
             out = [{"designation": r[0], "ra": float(r[1]), "dec": float(r[2]), "w1": _f(r[3], 15.0), "w2": _f(r[4], 14.5)} for r in rows if len(r) >= 5]
             if out:
                 _cache_save("wise", ra_deg, dec_deg, fov_deg, out)
@@ -983,12 +1021,7 @@ def irsa_releases():
 import ledger as LEDGER_MOD  # shared, persistent, vote-based ledger (ledger.py)
 import spherex_real as SPX      # real SPHEREx pixels and spectra (spherex_real.py)
 
-SPX.configure(
-    lambda url, params=None, timeout=20.0, retries=1, headers_extra=None: _get(url, params, timeout, retries, headers_extra=headers_extra),
-    lambda url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw: _post(
-        url, data, timeout, retries, headers_extra=headers_extra, **kw
-    ),
-)
+SPX.configure(lambda url, params=None, timeout=20.0, retries=1, headers_extra=None: _get(url, params, timeout, retries, headers_extra=headers_extra))
 LEDGER = LEDGER_MOD.Ledger(os.path.join(DATA_DIR, "ledger.json"), seed=DISCOVERY_LEDGER)
 
 
@@ -1047,12 +1080,8 @@ def spherex_field(ra: float = Query(...), dec: float = Query(...), fov: float = 
     """Real SPHEREx two-visit images (IMAGE - ZODI) for each detector, resampled to the 64x64 viewer grid."""
     try:
         return JSONResponse(content=SPX.field(ra, dec, min(max(fov, 1.0), 30.0), CACHE_DIR))
-    except requests.Timeout as exc:
-        raise HTTPException(status_code=504, detail=f"SPHEREx archive timed out: {type(exc).__name__}: {str(exc)[:200]}")
-    except requests.ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=f"SPHEREx archive temporarily unreachable: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SPHEREx archive/query error: {type(exc).__name__}: {str(exc)[:200]}")
+        raise HTTPException(status_code=502, detail=f"SPHEREx archive: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 @app.get("/api/spherex/spectrum")
@@ -1060,12 +1089,8 @@ def spherex_spectrum(ra: float = Query(...), dec: float = Query(...), n: int = Q
     """Real SPHEREx spectrum at a position from up to n exposures (byte-range reads, a few kB per exposure)."""
     try:
         return JSONResponse(content=SPX.spectrum(ra, dec, CACHE_DIR, max_images=min(max(n, 6), 200)))
-    except requests.Timeout as exc:
-        raise HTTPException(status_code=504, detail=f"SPHEREx archive timed out: {type(exc).__name__}: {str(exc)[:200]}")
-    except requests.ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=f"SPHEREx archive temporarily unreachable: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SPHEREx archive/query error: {type(exc).__name__}: {str(exc)[:200]}")
+        raise HTTPException(status_code=502, detail=f"SPHEREx archive: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 # ---------------- known small bodies (JPL) ----------------
@@ -1300,13 +1325,12 @@ def spherex_coverage_point(ra: float = Query(...), dec: float = Query(...)):
     if hit is not None:
         return hit
     try:
-        rows = _tap_csv(IRSA_TAP, "SELECT COUNT(*), MIN(p.time_bounds_lower), MAX(p.time_bounds_lower) FROM spherex.artifact a "
-                                  "JOIN spherex.plane p ON a.planeid = p.planeid "
-                                  f"WHERE 1 = CONTAINS(POINT('ICRS', {ra:.6f}, {dec:.6f}), p.poly)", 60)
+        items = SPX.list_images(ra, dec, CACHE_DIR)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"IRSA SPHEREx count: {type(exc).__name__}: {str(exc)[:160]}")
-    r = rows[0] if rows else ["0", "", ""]
-    out = {"ra": ra, "dec": dec, "n_images": int(float(r[0] or 0)), "mjd_first": _f(r[1]), "mjd_last": _f(r[2]), "source": "IRSA spherex.plane"}
+        raise HTTPException(status_code=502, detail=f"IRSA SPHEREx image list: {type(exc).__name__}: {str(exc)[:160]}")
+    mj = [i["mjd"] for i in items if i.get("mjd")]
+    out = {"ra": ra, "dec": dec, "n_images": len(items), "mjd_first": min(mj) if mj else None, "mjd_last": max(mj) if mj else None,
+           "source": "IRSA SIA2 (SPHEREx collections)"}
     _cache_save_any("covpt", key, out)
     return out
 
@@ -1314,98 +1338,97 @@ def spherex_coverage_point(ra: float = Query(...), dec: float = Query(...)):
 @app.get("/api/xmatch")
 def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: float = Query(45.0, ge=5, le=300),
                        mode: str = Query("both"), pmra: float = Query(0.0), pmdec: float = Query(0.0), t0: float = Query(2025.9)):
-    """CatWISE2020 and NEOWISE-R queries. Wait for every selected IRSA request to finish;
-    never turn a still-running worker into a successful empty result."""
-    # xmatch3 intentionally bypasses old xmatch2 entries, which may have been written after
-    # the former 130-second thread join returned before the 140/150-second TAP requests ended.
+    """CatWISE2020 (proper motions, epoch ~2015.4) and NEOWISE-R single exposures (2013-2024).
+    NEOWISE is searched in a narrow corridor along the expected track (ra, dec at epoch t0 moving with pmra, pmdec in arcsec/yr),
+    or in a small circle when no motion is given, so a dense field never hits the row limit."""
     key = f"{ra:.5f}|{dec:.5f}|{radius:.0f}|{mode}|{pmra:.3f}|{pmdec:.3f}|{t0:.2f}"
-    hit = _cache_load_any("xmatch3", key)
+    hit = _cache_load_any("xmatch2", key)
     if hit is not None:
         return hit
     cosd = max(1e-6, math.cos(math.radians(dec)))
     out = {"ra": ra, "dec": dec, "radius_arcsec": radius, "catwise": [], "neowise": [], "errors": [], "neowise_region": None}
-    failures = []
-
-    def record_failure(service, exc):
-        # Lists are append-safe across the two worker threads; the main thread reads them
-        # only after all futures have completed.
-        failures.append((service, exc))
-        out["errors"].append(f"{service}: {type(exc).__name__}: {str(exc)[:180]}")
 
     def cat():
-        circ = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{radius / 3600.0:.6f})"
+        cols = "source_name,ra,dec,w1mpro,w2mpro,pmra,pmdec,sigpmra,sigpmdec"
+        why = ""
         try:
+            g = _gator_cone("catwise_2020", ra, dec, radius, cols, 60)
+            g = [x for x in g if _flt(x.get("ra")) is not None and _flt(x.get("dec")) is not None]
+            g.sort(key=lambda x: _sep_arcsec(ra, dec, x["ra"], x["dec"]))
+            out["catwise"] = [{"name": x.get("source_name"), "ra": x["ra"], "dec": x["dec"], "w1": _flt(x.get("w1mpro")), "w2": _flt(x.get("w2mpro")),
+                               "pmra": _flt(x.get("pmra")), "pmdec": _flt(x.get("pmdec")), "e_pmra": _flt(x.get("sigpmra")), "e_pmdec": _flt(x.get("sigpmdec"))}
+                              for x in g[:500]]
+            return
+        except Exception as exc:  # noqa: BLE001
+            why = f"Gator {type(exc).__name__}: {str(exc)[:90]}"
+        try:  # backup: the slower TAP service
+            circ = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{radius / 3600.0:.6f})"
             rows = _tap_csv(IRSA_TAP, "SELECT TOP 500 source_name, ra, dec, w1mpro, w2mpro, pmra, pmdec, sigpmra, sigpmdec FROM catwise_2020 "
-                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {circ})", 140)
+                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {circ})", 40)
             out["catwise"] = [{"name": r[0], "ra": _f(r[1]), "dec": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4]),
-                               "pmra": _f(r[5]), "pmdec": _f(r[6]), "e_pmra": _f(r[7]), "e_pmdec": _f(r[8])} for r in rows if len(r) >= 9]
-        except Exception as exc:
-            record_failure("CatWISE2020", exc)
+                               "pmra": _f(r[5]), "pmdec": _f(r[6]), "e_pmra": _f(r[7]), "e_pmdec": _f(r[8])} for r in rows]
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"CatWISE2020: {why}; TAP {type(exc).__name__}: {str(exc)[:80]}")
 
     def neo():
         mu = math.hypot(pmra, pmdec)
-        if mu > 0.02:
-            def at(t):
-                return ra + pmra * (t - t0) / 3600.0 / cosd, dec + pmdec * (t - t0) / 3600.0
-            (ra1, de1), (ra2, de2) = at(2013.4), at(2024.7)
-            ux, uy = (ra2 - ra1) * cosd, de2 - de1
-            n = math.hypot(ux, uy) or 1e-9
-            w = 12.0 / 3600.0  # corridor half-width
-            px, py = -uy / n * w, ux / n * w
-            ex, ey = ux / n * w, uy / n * w
-            pts = [(ra1 - ex / cosd + px / cosd, de1 - ey + py), (ra2 + ex / cosd + px / cosd, de2 + ey + py),
-                   (ra2 + ex / cosd - px / cosd, de2 + ey - py), (ra1 - ex / cosd - px / cosd, de1 - ey - py)]
-            region = "POLYGON('ICRS'," + ",".join(f"{p[0] % 360:.6f},{p[1]:.6f}" for p in pts) + ")"
+
+        def at(t):
+            return ra + pmra * (t - t0) / 3600.0 / cosd, dec + pmdec * (t - t0) / 3600.0
+        if mu > 0.02:  # moving source: a corridor along its expected track over the NEOWISE years
+            cra, cdec = at(2019.05)
+            crad = max(20.0, 5.65 * mu + 15.0)  # half the track length plus the corridor width
             out["neowise_region"] = {"kind": "corridor", "half_width_arcsec": 12}
         else:
-            # Preserve the existing 25-arcsec static-source search region.
-            region = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{min(radius, 25.0) / 3600.0:.6f})"
+            cra, cdec, crad = ra, dec, min(radius, 25.0)
             out["neowise_region"] = {"kind": "circle", "radius_arcsec": min(radius, 25.0)}
+        why = ""
         try:
+            g = _gator_cone("neowiser_p1bs_psd", cra, cdec, crad, "ra,dec,mjd,w1mpro,w2mpro", 90)
+            rows = []
+            for x in g:
+                if None in (_flt(x.get("ra")), _flt(x.get("dec")), _flt(x.get("mjd"))) or _flt(x.get("w2mpro")) is None:
+                    continue
+                if mu > 0.02:
+                    ea, ed = at(2000.0 + (x["mjd"] - 51544.5) / 365.25)
+                    if _sep_arcsec(ea, ed, x["ra"], x["dec"]) > 12.0:
+                        continue
+                rows.append({"ra": x["ra"], "dec": x["dec"], "mjd": x["mjd"], "w1": _flt(x.get("w1mpro")), "w2": x["w2mpro"]})
+            rows.sort(key=lambda r: r["mjd"])
+            out["neowise"] = rows[:5000]
+            out["neowise_truncated"] = len(rows) > 5000
+            return
+        except Exception as exc:  # noqa: BLE001
+            why = f"Gator {type(exc).__name__}: {str(exc)[:90]}"
+        try:  # backup: the slower TAP service
+            if mu > 0.02:
+                (ra1, de1), (ra2, de2) = at(2013.4), at(2024.7)
+                ux, uy = (ra2 - ra1) * cosd, de2 - de1
+                n = math.hypot(ux, uy) or 1e-9
+                w = 12.0 / 3600.0
+                px, py = -uy / n * w, ux / n * w
+                ex, ey = ux / n * w, uy / n * w
+                pts = [(ra1 - ex / cosd + px / cosd, de1 - ey + py), (ra2 + ex / cosd + px / cosd, de2 + ey + py),
+                       (ra2 + ex / cosd - px / cosd, de2 + ey - py), (ra1 - ex / cosd - px / cosd, de1 - ey - py)]
+                region = "POLYGON('ICRS'," + ",".join(f"{p[0] % 360:.6f},{p[1]:.6f}" for p in pts) + ")"
+            else:
+                region = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{min(radius, 25.0) / 3600.0:.6f})"
             rows = _tap_csv(IRSA_TAP, "SELECT TOP 5000 ra, dec, mjd, w1mpro, w2mpro FROM neowiser_p1bs_psd "
-                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {region}) AND w2mpro IS NOT NULL", 150)
-            out["neowise"] = [{"ra": _f(r[0]), "dec": _f(r[1]), "mjd": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4])} for r in rows if len(r) >= 5]
+                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {region}) AND w2mpro IS NOT NULL", 40)
+            out["neowise"] = [{"ra": _f(r[0]), "dec": _f(r[1]), "mjd": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4])} for r in rows]
             out["neowise_truncated"] = len(rows) >= 5000
-        except Exception as exc:
-            record_failure("NEOWISE-R", exc)
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"NEOWISE-R: {why}; TAP {type(exc).__name__}: {str(exc)[:80]}")
 
     jobs = ([cat] if mode in ("both", "catwise") else []) + ([neo] if mode in ("both", "neowise") else [])
-    if not jobs:
-        raise HTTPException(status_code=400, detail="mode must be 'both', 'catwise', or 'neowise'")
-
-    # Context-manager shutdown waits for every task. Each TAP request has its own bounded
-    # network timeout (140s/150s), so no worker can be silently abandoned at 130 seconds.
-    with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="irsa-xmatch") as ex:
-        futures = {ex.submit(fn): fn.__name__ for fn in jobs}
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:  # defensive: worker functions normally capture their own errors
-                record_failure(futures[future], exc)
-
-    out["source"] = "NASA/IPAC IRSA TAP: catwise_2020, neowiser_p1bs_psd"
-    out["query_status"] = {
-        "catwise": "error" if any(name == "CatWISE2020" for name, _ in failures) else ("ok" if mode in ("both", "catwise") else "not_requested"),
-        "neowise": "error" if any(name == "NEOWISE-R" for name, _ in failures) else ("ok" if mode in ("both", "neowise") else "not_requested"),
-    }
-
-    # Only cache a complete response. A legitimate completed zero-row query is valid and
-    # cacheable; any failed/timeout service keeps the response uncached for the next retry.
-    if not failures:
-        _cache_save_any("xmatch3", key, out)
-    elif not out["catwise"] and not out["neowise"]:
-        statuses = []
-        for _, exc in failures:
-            if isinstance(exc, requests.Timeout):
-                statuses.append(504)
-            elif isinstance(exc, requests.ConnectionError):
-                statuses.append(503)
-            else:
-                response = getattr(exc, "response", None)
-                upstream_status = getattr(response, "status_code", None)
-                statuses.append(upstream_status if upstream_status in (502, 503, 504) else 502)
-        status = 504 if 504 in statuses else (503 if 503 in statuses else 502)
-        raise HTTPException(status_code=status, detail=" | ".join(out["errors"]))
+    th = [threading.Thread(target=f) for f in jobs]
+    [t.start() for t in th]
+    [t.join(130) for t in th]
+    out["source"] = "NASA/IPAC IRSA Gator: catwise_2020, neowiser_p1bs_psd"
+    if not out["errors"]:
+        _cache_save_any("xmatch2", key, out)
+    if out["errors"] and not out["catwise"] and not out["neowise"]:
+        raise HTTPException(status_code=502, detail=" | ".join(out["errors"]))
     return out
 
 
