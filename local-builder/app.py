@@ -198,7 +198,7 @@ def parse_coordinates(ra_input: str, dec_input: str) -> Tuple[float, float]:
 # -------------------------------------------------------------------------
 # LIVE NASA / IPAC IRSA & ESA GAIA ARCHIVE QUERY ENGINE
 # -------------------------------------------------------------------------
-UA = {"User-Agent": "CHRONOS-102-V7.3/1.0"}
+UA = {"User-Agent": "CHRONOS-102 (SPHEREx citizen-science tool)"}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SITE_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "website"))   # the folder that is published
 DEMO_DIR = os.path.join(SITE_DIR, "demo")
@@ -264,10 +264,10 @@ def _get_raw(url, params=None, timeout=20.0, retries=1, headers_extra=None, **kw
                 time.sleep(2.0 * (i + 1))
                 continue
             return r
-        except (requests.ConnectionError, requests.Timeout) as exc:
+        except requests.ConnectionError as exc:
             last = exc
             if i < retries:
-                time.sleep(1.5 * (i + 1))
+                time.sleep(1.5)
                 continue
             raise
     raise last
@@ -1136,8 +1136,6 @@ SPX.configure(
     lambda url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw: _post(
         url, data, timeout, retries, headers_extra=headers_extra, **kw
     ),
-    verify=VERIFY,
-    user_agent=UA["User-Agent"],
 )
 LEDGER = LEDGER_MOD.Ledger(os.path.join(DATA_DIR, "ledger.json"), seed=DISCOVERY_LEDGER)
 
@@ -1236,31 +1234,19 @@ def _sexa(v: float, hours: bool) -> str:
 
 @app.get("/api/net-check")
 def net_check():
-    """Probe the same archive clients used by production endpoints."""
+    """Shows which archives this server can reach right now (name, HTTP status, milliseconds)."""
     out = {"region": os.environ.get("VERCEL_REGION", "local"), "archives": {}}
-    probes = (
-        ("NASA IRSA Gator", lambda: _get(
-            "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query?catalog=catwise_2020&spatial=cone&objstr=83.822+-5.391&radius=5&radunits=arcsec&outfmt=1&selcols=ra,dec",
-            None, 15, retries=1)),
-        ("NASA JPL", lambda: _get("https://ssd-api.jpl.nasa.gov/sbdb.api?sstr=Ceres", None, 15, retries=1)),
-        ("ESA Gaia", lambda: _get("https://gea.esac.esa.int/tap-server/tap/availability", None, 15, retries=1)),
-        ("CDS Sesame", lambda: _get("https://cds.unistra.fr/cgi-bin/nph-sesame/-oxp/SNV?M42", None, 15, retries=1)),
-    )
-    for name, probe in probes:
+    for name, url in (("NASA IRSA Gator", "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query?catalog=catwise_2020&spatial=cone&objstr=83.822+-5.391&radius=5&radunits=arcsec&outfmt=1&selcols=ra,dec"),
+                      ("NASA SPHEREx SIA2", "https://irsa.ipac.caltech.edu/SIA?COLLECTION=spherex_dr1&POS=circle+83.822+-5.391+0.01&RESPONSEFORMAT=CSV"),
+                      ("NASA JPL", "https://ssd-api.jpl.nasa.gov/sbdb.api?sstr=Ceres"),
+                      ("ESA Gaia", "https://gea.esac.esa.int/tap-server/tap/availability"),
+                      ("CDS Sesame", "https://cds.unistra.fr/cgi-bin/nph-sesame/-oxp/SNV?M42")):
         t0 = time.time()
         try:
-            response = probe()
-            out["archives"][name] = {"ok": response.status_code == 200, "http": response.status_code,
-                                     "ms": int((time.time() - t0) * 1000)}
+            r = requests.get(url, timeout=(8, 15), headers=UA, verify=VERIFY)
+            out["archives"][name] = {"ok": r.status_code == 200, "http": r.status_code, "ms": int((time.time() - t0) * 1000)}
         except Exception as exc:  # noqa: BLE001
-            out["archives"][name] = {"ok": False,
-                                     "error": f"{type(exc).__name__}: {str(exc)[:180]}",
-                                     "ms": int((time.time() - t0) * 1000)}
-
-    t0 = time.time()
-    sia = SPX.probe_sia2(83.822, -5.391, timeout=18.0)
-    sia["ms"] = int((time.time() - t0) * 1000)
-    out["archives"]["NASA SPHEREx SIA2"] = sia
+            out["archives"][name] = {"ok": False, "error": type(exc).__name__, "ms": int((time.time() - t0) * 1000)}
     return out
 
 

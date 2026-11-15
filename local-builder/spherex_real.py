@@ -62,103 +62,28 @@ def _mask_flags(f, img, x0, y0, w, h):
 # HTTP functions are injected by app.py so SPHEREx uses the application's shared session.
 _GET: Callable = None  # type: ignore
 _POST: Callable = None  # type: ignore
-_VERIFY = True
-_USER_AGENT = "CHRONOS-102-V7.3/1.0"
-_TRANSIENT_HTTP = {502, 503, 504}
-
-# A second session bypasses HTTP(S)_PROXY / environment proxy settings. It is
-# used only after the normal application transport fails for an IRSA request.
-# This directly tests the exact failure mode seen on the hosted Vercel function.
-_DIRECT_SESSION = requests.Session()
-_DIRECT_SESSION.trust_env = False
-_DIRECT_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=24, max_retries=0))
-_DIRECT_SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=12, max_retries=0))
 
 
-def configure(getter: Callable, poster: Optional[Callable] = None,
-              verify: bool = True, user_agent: str = "CHRONOS-102-V7.3/1.0"):
-    global _GET, _POST, _VERIFY, _USER_AGENT
+def configure(getter: Callable, poster: Optional[Callable] = None):
+    global _GET, _POST
     _GET = getter
     _POST = poster
-    _VERIFY = bool(verify)
-    _USER_AGENT = user_agent or "CHRONOS-102-V7.3/1.0"
-
-
-def _direct_request(method: str, url: str, params=None, data=None,
-                    timeout: float = 40, headers_extra=None,
-                    allow_redirects=True):
-    headers = {"User-Agent": _USER_AGENT}
-    if headers_extra:
-        headers.update(headers_extra)
-    return _DIRECT_SESSION.request(
-        method=method,
-        url=url,
-        params=params,
-        data=data,
-        timeout=(min(8.0, float(timeout)), float(timeout)),
-        headers=headers,
-        verify=_VERIFY,
-        allow_redirects=allow_redirects,
-    )
 
 
 def _spx_get(url, params=None, timeout=40, retries=1, headers_extra=None):
-    """Try shared transport first, then direct egress if IRSA returns proxy/5xx errors."""
+    """SPHEREx-only GET retry wrapper; do not change retry policy for other archives."""
     if _GET is None:
         raise RuntimeError("SPHEREx HTTP getter is not configured")
-
-    shared_problem = None
-    try:
-        response = _GET(url, params, timeout, retries=retries, headers_extra=headers_extra)
-        if response.status_code not in _TRANSIENT_HTTP:
-            response._chronos_transport = "shared-session"
-            return response
-        shared_problem = f"shared-session HTTP {response.status_code}"
-    except (requests.ConnectionError, requests.Timeout) as exc:
-        shared_problem = f"shared-session {type(exc).__name__}: {str(exc)[:140]}"
-
-    # Do not let an environment proxy failure prevent a direct IRSA attempt.
-    try:
-        response = _direct_request("GET", url, params=params, timeout=timeout,
-                                   headers_extra=headers_extra, allow_redirects=True)
-        response._chronos_transport = "direct-no-env-proxy"
-        if response.status_code not in _TRANSIENT_HTTP:
-            return response
-        direct_problem = f"direct-no-env-proxy HTTP {response.status_code}"
-    except Exception as exc:  # noqa: BLE001
-        direct_problem = f"direct-no-env-proxy {type(exc).__name__}: {str(exc)[:140]}"
-
-    raise RuntimeError(f"IRSA GET failed via both transports ({shared_problem}; {direct_problem})")
-
-
-def _spx_post(url, data=None, timeout=40, retries=0, headers_extra=None, **kwargs):
-    """TAP POST with one direct-egress fallback; POST is not automatically replayed."""
-    if _POST is None:
-        raise RuntimeError("IRSA asynchronous TAP POST is not configured")
-
-    shared_problem = None
-    try:
-        response = _POST(url, data=data, timeout=timeout, retries=retries,
-                         headers_extra=headers_extra, **kwargs)
-        if response.status_code not in _TRANSIENT_HTTP:
-            response._chronos_transport = "shared-session"
-            return response
-        shared_problem = f"shared-session HTTP {response.status_code}"
-    except (requests.ConnectionError, requests.Timeout) as exc:
-        shared_problem = f"shared-session {type(exc).__name__}: {str(exc)[:140]}"
-
-    try:
-        response = _direct_request("POST", url, data=data, timeout=timeout,
-                                   headers_extra=headers_extra,
-                                   allow_redirects=kwargs.get("allow_redirects", True))
-        response._chronos_transport = "direct-no-env-proxy"
-        if response.status_code not in _TRANSIENT_HTTP:
-            return response
-        direct_problem = f"direct-no-env-proxy HTTP {response.status_code}"
-    except Exception as exc:  # noqa: BLE001
-        direct_problem = f"direct-no-env-proxy {type(exc).__name__}: {str(exc)[:140]}"
-
-    raise RuntimeError(f"IRSA POST failed via both transports ({shared_problem}; {direct_problem})")
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            return _GET(url, params, timeout, retries=1, headers_extra=headers_extra)
+        except requests.Timeout as exc:
+            last = exc
+            if attempt >= retries:
+                raise
+            time.sleep(1.0 * (attempt + 1))
+    raise last
 
 
 def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
@@ -166,7 +91,7 @@ def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
     if _POST is None:
         raise RuntimeError("IRSA asynchronous TAP POST is not configured")
 
-    response = _spx_post(
+    response = _POST(
         TAP_ASYNC,
         data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql},
         timeout=30,
@@ -185,7 +110,7 @@ def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
         raise RuntimeError("IRSA async TAP returned an unexpected job URL")
 
     # UWS jobs are created in PENDING state; explicitly start the job.
-    run_response = _spx_post(job_url + "/phase", data={"PHASE": "RUN"}, timeout=20, retries=0, allow_redirects=False)
+    run_response = _POST(job_url + "/phase", data={"PHASE": "RUN"}, timeout=20, retries=0, allow_redirects=False)
     if run_response.status_code not in (200, 201, 202, 303):
         run_response.raise_for_status()
         raise RuntimeError(f"IRSA async TAP could not start job (HTTP {run_response.status_code})")
@@ -573,53 +498,21 @@ def _normalise_sia2_rows(rows: List[Dict[str, str]]) -> List[Dict]:
     return out
 
 
-def _sia2_query_url(ra: float, dec: float) -> str:
-    """Build the same repeated-COLLECTION GET URL used by the successful Colab V7.3 test."""
-    collections = "&".join(f"COLLECTION={collection}" for collection in SIA2_COLLECTIONS)
-    return (f"{SIA2}?{collections}"
-            f"&POS=circle+{ra:.6f}+{dec:.6f}+0.01"
-            "&RESPONSEFORMAT=CSV")
-
-
-def _sia2_fetch_rows(ra: float, dec: float, timeout: float = 55.0):
-    """Fetch SIA2 CSV using the Colab-tested URL and validate the response."""
-    url = _sia2_query_url(ra, dec)
-    response = _spx_get(url, None, timeout=timeout, retries=2)
+def _list_images_sia2(ra: float, dec: float) -> List[Dict]:
+    params = [("COLLECTION", collection) for collection in SIA2_COLLECTIONS]
+    params.extend([
+        ("POS", f"circle {ra:.6f} {dec:.6f} 0.01"),
+        ("RESPONSEFORMAT", "CSV"),
+    ])
+    response = _spx_get(SIA2, params, timeout=55, retries=2)
     response.raise_for_status()
-    body = (response.text or "").lstrip("\ufeff").strip()
+    body = response.text.strip()
     if body.startswith("<"):
         messages = [x.strip() for x in re.findall(r"<INFO[^>]*>([^<]*)</INFO>", body, re.S) if x.strip()]
-        message = messages[0] if messages else re.sub(r"\s+", " ", body)[:200]
-        raise RuntimeError("IRSA SIA2 returned an XML error: " + message)
+        raise RuntimeError("IRSA SIA2 returned an XML error: " + (messages[0] if messages else re.sub(r"\s+", " ", body)[:200]))
     rows = _csv_dict_rows(body)
     if rows and not any(_row_value(row, "access_url") for row in rows):
         raise RuntimeError("IRSA SIA2 returned records without an access_url column")
-    return response, rows
-
-
-def probe_sia2(ra: float, dec: float, timeout: float = 18.0) -> Dict:
-    """Probe production SIA2, reporting transport, raw rows and usable FITS rows."""
-    try:
-        response, rows = _sia2_fetch_rows(ra, dec, timeout=timeout)
-        images = _normalise_sia2_rows(rows)
-        result = {
-            "ok": bool(response.status_code == 200 and (not rows or images)),
-            "http": response.status_code,
-            "records": len(rows),
-            "fits_records": len(images),
-            "transport": getattr(response, "_chronos_transport", "shared-session"),
-            "collections": list(SIA2_COLLECTIONS),
-        }
-        if rows and not images:
-            result["error"] = "SIA2 returned rows, but none matched the SPHEREx Level-2 FITS metadata; columns=" + ",".join(rows[0].keys())[:180]
-        return result
-    except Exception as exc:  # noqa: BLE001
-        detail = re.sub(r"\s+", " ", str(exc))[:260]
-        return {"ok": False, "error": f"{type(exc).__name__}: {detail}"}
-
-
-def _list_images_sia2(ra: float, dec: float) -> List[Dict]:
-    response, rows = _sia2_fetch_rows(ra, dec, timeout=55.0)
     normalised = _normalise_sia2_rows(rows)
     if rows and not normalised:
         raise RuntimeError("IRSA SIA2 returned records, but none matched the expected SPHEREx Level-2 FITS filename/metadata format")
