@@ -744,7 +744,15 @@
     function connBegin(k) { if (k) { connS[k].n++; connRender(); } }
     function connEnd(k, ok, note) { if (!k) return; const s = connS[k]; s.n = Math.max(0, s.n - 1); if (ok === true) { s.ok++; s.okNote = note || ""; } else if (ok === false) { s.bad++; s.badNote = note || ""; } connRender(); }
     function connReset(k) { const s = connS[k]; if (s) { s.n = 0; s.ok = 0; s.bad = 0; s.okNote = ""; s.badNote = ""; connRender(); } }
-    const connShort = m => /time|50[234]|abort|no answer/i.test(String(m)) ? "no answer in time" : /Failed to fetch|NetworkError|CORS/i.test(String(m)) ? "blocked / unreachable" : (String(m).replace(/https?:\/\/\S+/g, "").slice(0, 60) || "failed");
+    const connShort = m => {
+      const s = String(m || "");
+      if (/HTTP 504|ReadTimeout|ConnectTimeout|timed? out|no answer within|AbortError/i.test(s)) return "timed out";
+      if (/HTTP 503|temporarily unavailable|ConnectionError|Failed to establish a new connection/i.test(s)) return "service unavailable";
+      if (/HTTP 502|TAP error|archive\/query error|query failed/i.test(s)) return "archive / query error";
+      if (/Failed to fetch|NetworkError|CORS|blocked/i.test(s)) return "blocked / unreachable";
+      if (/no matches|zero rows|no sources/i.test(s)) return "connected · no matches";
+      return (s.replace(/https?:\/\/\S+/g, "").slice(0, 60) || "failed");
+    };
     const CONN_RETRY = { spx: () => { realKey = null; ensureRealField(); }, jpl: () => { knownKey = null; checkKnownObjects(false); }, neo: () => crossCheckWISE() };
     function connRender() {
       const box = document.getElementById("conn-rows"); if (!box) return;
@@ -783,7 +791,7 @@
 
     let backendAlive = (typeof location !== "undefined") && /^https?:$/.test(location.protocol); // checked at start-up: if /api does not answer, the page talks to the archives directly
     let fieldCtl = null; // cancels the previous field's archive requests when the user moves on (frees browser connections)
-    async function fetchField(ra, dec, fov) {
+    async function fetchField(ra, dec, fov, demoRa = ra, demoDec = dec) {
       if (fieldCtl) fieldCtl.abort(); const ctl = fieldCtl = new AbortController(); connReset("gaia"); connReset("wise");
       const rad = Math.min(Math.max(fov * 0.72 / 60, 0.02), 0.5).toFixed(4);
       const F = { key: `${ra.toFixed(5)}|${dec.toFixed(5)}|${fov}`, gaia: [], wise: [], gaiaSrc: null, wiseSrc: null, synthetic: false };
@@ -799,18 +807,30 @@
       ];
       const EMB = (typeof window !== "undefined" && window.CHRONOS_EMBED) || null, embHit = EMB && EMB.archives && Math.abs(+EMB.ra - ra) < 2e-3 && Math.abs(+EMB.dec - dec) < 2e-3;
       if (embHit) gaiaTries.unshift(["host page", async () => (EMB.archives.gaia_dr3 || []).map(s => [s.source_id, s.ra, s.dec, s.g_mag, s.pmra_mas_yr, s.pmdec_mas_yr, s.parallax_mas, s.bp_rp])]);
-      const tries = (backendAlive || demoField(ra, dec)) ? gaiaTries.filter(t => t[0] === "FastAPI proxy") : gaiaTries; // backend running: skip browser-direct calls that are CORS-blocked anyway
+      const demoHit = demoField(demoRa, demoDec);
+      const tries = (backendAlive || demoHit) ? gaiaTries.filter(t => t[0] === "FastAPI proxy") : gaiaTries; // backend running: skip browser-direct calls that are CORS-blocked anyway
       const gaiaJob = new Promise(res => { // all Gaia sources race in parallel; first one with data wins
         let left = tries.length;
         tries.forEach(([name, fn]) => fn().then(rows => {
           if (rows && rows.length && !F.gaiaSrc) { F.gaia = rows.map(r => ({ id: String(r[0]), ra: +r[1], dec: +r[2], g: num(r[3]) ?? 19, pmra: num(r[4]) ?? 0, pmdec: num(r[5]) ?? 0, plx: num(r[6]) ?? 0, bprp: num(r[7]) })); F.gaiaSrc = name === "FastAPI proxy" && F.proxyGaiaSrc ? "FastAPI proxy -> " + F.proxyGaiaSrc : name; res(); }
         }).catch(e => { if (!ctl.signal.aborted) logLine("WARN", `Gaia source "${name}" failed: ${e && e.name === "AbortError" ? "timeout" : e && e.message}`); }).finally(() => { if (--left === 0) res(); }));
       });
-      const setWise = (rows, src) => { F.wise.splice(0, F.wise.length, ...rows); F.wiseSrc = src; logLine("OK  ", `AllWISE: ${rows.length} sources from ${src}`); if (typeof model !== "undefined" && model && model.F === F && typeof drawHud === "function") drawHud(); };
+      const setWise = (rows, src) => {
+        const ast = activeAstrometry && activeAstrometry.pmra != null && activeAstrometry.pmdec != null ? activeAstrometry : null;
+        const propagateAst = epoch => { if (!ast) return null; const dt = epoch - (ast.ref_epoch || 2000.0), cd = Math.max(1e-6, Math.cos(ast.dec * Math.PI / 180)); return { ra: (ast.ra + ast.pmra / 3600000 * dt / cd + 360) % 360, dec: Math.max(-90, Math.min(90, ast.dec + ast.pmdec / 3600000 * dt)) }; };
+        const atWise = propagateAst(2010.5), atNow = propagateAst(2026.0);
+        const mapped = rows.map(w => {
+          if (!ast || !atWise || !atNow || w.ra == null || w.dec == null) return w;
+          const dra = (w.ra - atWise.ra + 540) % 360 - 180, sep = Math.hypot(dra * Math.cos(atWise.dec * Math.PI / 180) * 3600, (w.dec - atWise.dec) * 3600);
+          return sep < 8 ? { ...w, ra: atNow.ra, dec: atNow.dec, target_astrometry: true } : w;
+        });
+        F.wise.splice(0, F.wise.length, ...mapped); F.wiseSrc = src; logLine("OK  ", `AllWISE: ${rows.length} sources from ${src}`);
+        if (typeof model !== "undefined" && model && model.F === F && typeof drawHud === "function") drawHud();
+      };
       (async () => { // AllWISE loads in the BACKGROUND: it never delays the image
         try {
           if (embHit && (EMB.archives.irsa_wise || []).length) setWise(EMB.archives.irsa_wise.map(w => ({ id: w.designation, ra: w.ra, dec: w.dec, w1: w.w1, w2: w.w2 })), "host page (IRSA)");
-          else if (backendAlive || demoField(ra, dec)) { const j = await fetchJSON(`${backendBase()}/api/archives?what=wise&ra=${ra}&dec=${dec}&fov=${fov}`, 90000, ctl.signal); (j.errors || []).forEach(m => logLine("WARN", "backend: " + m)); if (!j.irsa_wise.length && (j.errors || []).length) { logLine("WARN", "AllWISE: no sources this time (IRSA timed out) - keeping previous overlay"); return; } setWise(j.irsa_wise.map(s => ({ id: s.designation, ra: s.ra, dec: s.dec, w1: s.w1, w2: s.w2 })), "FastAPI proxy (IRSA)"); }
+          else if (backendAlive || demoHit) { const j = await fetchJSON(`${backendBase()}/api/archives?what=wise&ra=${ra}&dec=${dec}&fov=${fov}`, 90000, ctl.signal); (j.errors || []).forEach(m => logLine("WARN", "backend: " + m)); if (!j.irsa_wise.length && (j.errors || []).length) { logLine("WARN", "AllWISE: no sources this time (IRSA timed out) - keeping previous overlay"); return; } setWise(j.irsa_wise.map(s => ({ id: s.designation, ra: s.ra, dec: s.dec, w1: s.w1, w2: s.w2 })), "FastAPI proxy (IRSA)"); }
           else { const j = await fetchJSON(tapURL(CFG.irsaTap, `SELECT TOP 60 designation,ra,dec,w1mpro,w2mpro FROM allwise_p3as_psd WHERE ${circ("ra", "dec")} ORDER BY w1mpro ASC`), 20000); setWise(j.data.map(r => ({ id: String(r[0]), ra: +r[1], dec: +r[2], w1: num(r[3]), w2: num(r[4]) })), "IRSA AllWISE TAP"); }
         } catch (e) { if (!ctl.signal.aborted) logLine("WARN", `AllWISE failed: ${e && e.name === "AbortError" ? "timeout" : e && e.message}`); }
       })();
@@ -827,13 +847,18 @@
       "m45": [56.75, 24.1167], "pleiades": [56.75, 24.1167], "arcturus": [213.9153, 19.1824], "altair": [297.6958, 8.8683], "61 cygni": [316.7249, 38.7494], "lalande 21185": [165.8340, 35.9699] };
     async function resolveName(name) {
       const key = name.trim().toLowerCase().replace(/\s+/g, " ");
-      for (const k in BENCHMARKS) { const b = BENCHMARKS[k]; if (key === b.id || key === b.name.toLowerCase() || b.name.toLowerCase().includes(key) && key.length > 5) return { ra: b.ra_deg, dec: b.dec_deg, via: "benchmark catalog", id: k }; }
+      for (const k in BENCHMARKS) { const b = BENCHMARKS[k]; if (key === b.id || key === b.name.toLowerCase() || b.name.toLowerCase().includes(key) && key.length > 5) return { ra: b.ra_deg, dec: b.dec_deg, pmra: (b.pm_ra_arcsec_yr || 0) * 1000, pmdec: (b.pm_dec_arcsec_yr || 0) * 1000, ref_epoch: 2000.0, via: "benchmark catalog", id: k }; }
+      // Ask the backend first: its Sesame XML resolver returns the target's actual PMRA/PMDE.
+      try {
+        const j = await fetchJSON(`${backendBase()}/api/resolve?name=${encodeURIComponent(name.trim())}`, 9000);
+        if (j && j.ra !== undefined) return { ra: +j.ra, dec: +j.dec, pmra: j.pmra == null ? null : +j.pmra,
+          pmdec: j.pmdec == null ? null : +j.pmdec, ref_epoch: +(j.ref_epoch || 2000.0), via: j.via || "FastAPI/Sesame", id: j.id || null };
+      } catch (e) { }
       for (const host of ["https://cds.unistra.fr/cgi-bin/nph-sesame/-oI/SNV?", "https://cdsweb.u-strasbg.fr/cgi-bin/nph-sesame/-oI/SNV?", "https://vizier.cfa.harvard.edu/viz-bin/nph-sesame/-oI/SNV?"]) {
-        try { const t = await fetchText(host + encodeURIComponent(name.trim()), 6000); const m = t.match(/%J\s+([-+\d.eE]+)\s+([-+\d.eE]+)/); if (m) return { ra: +m[1], dec: +m[2], via: "Sesame " + host.split("/")[2] }; } catch (e) { logLine("WARN", `Sesame ${host.split("/")[2]} failed: ${e && e.message}`); }
+        try { const t = await fetchText(host + encodeURIComponent(name.trim()), 6000); const m = t.match(/%J\s+([-+\d.eE]+)\s+([-+\d.eE]+)/); if (m) return { ra: +m[1], dec: +m[2], pmra: null, pmdec: null, ref_epoch: 2000.0, via: "Sesame " + host.split("/")[2] }; } catch (e) { logLine("WARN", `Sesame ${host.split("/")[2]} failed: ${e && e.message}`); }
       }
-      try { const q = `SELECT ra,dec,main_id FROM basic JOIN ident ON oidref=oid WHERE id='${name.trim().replace(/'/g, "''")}'`; const j = await fetchJSON("https://simbad.cds.unistra.fr/simbad/sim-tap/sync?" + new URLSearchParams({ request: "doQuery", lang: "adql", format: "json", query: q }), 4500); if (j.data && j.data.length) return { ra: +j.data[0][0], dec: +j.data[0][1], via: "SIMBAD TAP" }; } catch (e) { }
-      try { const j = await fetchJSON(`${backendBase()}/api/resolve?name=${encodeURIComponent(name.trim())}`, 5000); if (j && j.ra !== undefined) return { ra: j.ra, dec: j.dec, via: "FastAPI/Sesame" }; } catch (e) { }
-      if (NAME_TABLE[key]) return { ra: NAME_TABLE[key][0], dec: NAME_TABLE[key][1], via: "offline name table" };
+      try { const q = `SELECT ra,dec,main_id FROM basic JOIN ident ON oidref=oid WHERE id='${name.trim().replace(/'/g, "''")}'`; const j = await fetchJSON("https://simbad.cds.unistra.fr/simbad/sim-tap/sync?" + new URLSearchParams({ request: "doQuery", lang: "adql", format: "json", query: q }), 4500); if (j.data && j.data.length) return { ra: +j.data[0][0], dec: +j.data[0][1], pmra: null, pmdec: null, ref_epoch: 2000.0, via: "SIMBAD TAP" }; } catch (e) { }
+      if (NAME_TABLE[key]) return { ra: NAME_TABLE[key][0], dec: NAME_TABLE[key][1], pmra: null, pmdec: null, ref_epoch: 2000.0, via: "offline name table" };
       return null;
     }
 
@@ -856,7 +881,10 @@
       const stars = [];
       if (!F.synthetic) {
         F.gaia.forEach(s => {
-          const x = N / 2 - ((s.ra - p.ra_deg) * cosd * 3600) / scale, y = N / 2 - ((s.dec - p.dec_deg) * 3600) / scale;
+          const dtGaia = 2026.0 - 2016.0, sCos = Math.max(1e-6, Math.cos(s.dec * Math.PI / 180));
+          const sRa2026 = (s.ra + (s.pmra / 3600000) * dtGaia / sCos + 360) % 360;
+          const sDec2026 = Math.max(-90, Math.min(90, s.dec + (s.pmdec / 3600000) * dtGaia));
+          const x = N / 2 - ((sRa2026 - p.ra_deg) * cosd * 3600) / scale, y = N / 2 - ((sDec2026 - p.dec_deg) * 3600) / scale;
           if (x < -8 || x > N + 8 || y < -8 || y > N + 8) return;
           const teff = teffFromBPRP(s.bprp), dx2 = -(s.pmra * BASE_YR / 1000) / scale, dy2 = -(s.pmdec * BASE_YR / 1000) / scale;
           stars.push({ id: s.id, x, y, x2: x + dx2, y2: y + dy2, x3: x + 2 * dx2, y3: y + 2 * dy2, flux: fluxFromG(s.g), g: s.g, teff, pmra: s.pmra, pmdec: s.pmdec, plx: s.plx, spec: starSpecFor(teff), real: true });
@@ -1038,8 +1066,14 @@
     function selectedBands() { const b = ALL_BANDS.filter(i => arrayOn[BAND[i]]); return b.length ? b : ALL_BANDS; }
 
     // ---------------- target / slew flow ----------------
+    let resolvedAstrometry = null; // resolver result; PM values are mas/year
+    let activeAstrometry = null; // astrometry verified against the coordinates currently displayed
     function selectBenchmark(key) {
       currentTargetKey = key;
+      const bAst = BENCHMARKS[key];
+      resolvedAstrometry = bAst ? { ra: bAst.ra_deg, dec: bAst.dec_deg,
+        pmra: (bAst.pm_ra_arcsec_yr || 0) * 1000, pmdec: (bAst.pm_dec_arcsec_yr || 0) * 1000,
+        ref_epoch: 2000.0, via: "CHRONOS benchmark astrometry" } : null;
       document.querySelectorAll(".bench-btn").forEach(b => b.classList.remove("btn-active"));
       if ($("btn-" + key)) $("btn-" + key).classList.add("btn-active");
       $("sel-chem").value = (key === "wise_0855" || key === "eps_indi_b") ? "ch4_brown_dwarf" : key === "planet_x_cand" ? "h2o_ice_comet" : "co_dust_variable";
@@ -1055,11 +1089,17 @@
         if (!r) { setStatus(`Could not resolve “${name}” (offline or unknown). Try coordinates.`, false); return; }
         $("input-ra").value = degToHMS(r.ra); $("input-dec").value = degToDMS(r.dec); $("input-name").value = "";
         currentTargetKey = r.id || null; window._resolvedVia = r.via + " → " + name;
+        resolvedAstrometry = { ra: r.ra, dec: r.dec, pmra: r.pmra == null ? null : r.pmra,
+          pmdec: r.pmdec == null ? null : r.pmdec, ref_epoch: r.ref_epoch || 2000.0, via: r.via };
       } else {
+        resolvedAstrometry = null;
         const p = parseCoordsJS($("input-ra").value, $("input-dec").value);
         if (!p) { setStatus("Cannot parse RA/Dec. Use 08h55m10.8s / -07d14m42s or decimal degrees, or type an object name.", false); return; }
         currentTargetKey = null; window._resolvedVia = null;
-        for (const k in BENCHMARKS) if (Math.hypot((p.ra_deg - BENCHMARKS[k].ra_deg) * Math.cos(p.dec_deg * Math.PI / 180), p.dec_deg - BENCHMARKS[k].dec_deg) < 0.01) currentTargetKey = k; // typed benchmark coords
+        for (const k in BENCHMARKS) if (Math.hypot((p.ra_deg - BENCHMARKS[k].ra_deg) * Math.cos(p.dec_deg * Math.PI / 180), p.dec_deg - BENCHMARKS[k].dec_deg) < 0.01) {
+          currentTargetKey = k; const b = BENCHMARKS[k]; resolvedAstrometry = { ra: b.ra_deg, dec: b.dec_deg,
+            pmra: (b.pm_ra_arcsec_yr || 0) * 1000, pmdec: (b.pm_dec_arcsec_yr || 0) * 1000, ref_epoch: 2000.0, via: "CHRONOS benchmark astrometry" };
+        } // typed benchmark coords
       }
       document.querySelectorAll(".bench-btn").forEach(b => b.classList.remove("btn-active"));
       if (currentTargetKey && $("btn-" + currentTargetKey)) $("btn-" + currentTargetKey).classList.add("btn-active");
@@ -1068,22 +1108,33 @@
     }
     async function observe() {
       const my = ++obsToken;
-      const p = parseCoordsJS($("input-ra").value, $("input-dec").value);
-      if (!p) { setStatus("Cannot parse RA/Dec.", false); return; }
+      const inputP = parseCoordsJS($("input-ra").value, $("input-dec").value);
+      if (!inputP) { setStatus("Cannot parse RA/Dec.", false); return; }
+      const demoHit = demoField(inputP.ra_deg, inputP.dec_deg) && !DEMO.rec;
+      const candidateAst = resolvedAstrometry && resolvedAstrometry.pmra != null && resolvedAstrometry.pmdec != null ? resolvedAstrometry : null;
+      const sepToResolved = candidateAst ? Math.hypot(((inputP.ra_deg - candidateAst.ra + 540) % 360 - 180) * Math.cos(candidateAst.dec * Math.PI / 180) * 3600, (inputP.dec_deg - candidateAst.dec) * 3600) : Infinity;
+      const ast = !demoHit && candidateAst && sepToResolved < 2.0 ? candidateAst : null;
+      activeAstrometry = ast;
+      const p = { ...inputP };
+      if (ast) {
+        const dt = 2026.0 - (ast.ref_epoch || 2000.0), cd = Math.max(1e-6, Math.cos(ast.dec * Math.PI / 180));
+        p.ra_deg = (ast.ra + ast.pmra / 3600000 * dt / cd + 360) % 360;
+        p.dec_deg = Math.max(-90, Math.min(90, ast.dec + ast.pmdec / 3600000 * dt));
+        p.reference_epoch = 2026.0;
+      }
       const fov = Math.min(30, Math.max(1, parseFloat($("input-fov").value) || 6.56));
-      const key = `${p.ra_deg.toFixed(5)}|${p.dec_deg.toFixed(5)}|${fov}`;
+      const key = `${p.ra_deg.toFixed(5)}|${p.dec_deg.toFixed(5)}|${fov}|${ast ? ast.pmra.toFixed(2) : 0}|${ast ? ast.pmdec.toFixed(2) : 0}|${ast ? (ast.ref_epoch || 2000.0) : 2000.0}`;
       if (!fieldCache || fieldCache.key !== key) {
-        // 1) instant provisional render (image changes immediately on every click) ...
+        // Render immediately, then replace the provisional stars with the live field catalogue.
         fieldCache = { key: "pending|" + key, gaia: [], wise: [], synthetic: true, pending: true };
         model = buildModel(p, fov, Object.assign({ targetKey: currentTargetKey }, readFilters())); resetSurvey(); updateAll(true);
         setStatus(`⏳ Showing provisional field — querying live Gaia DR3 / AllWISE around ${degToHMS(p.ra_deg)} ${degToDMS(p.dec_deg)}…`, false);
-        // 2) ... then swap in the real catalogue stars when they arrive
-        const F = await fetchField(p.ra_deg, p.dec_deg, fov);
-        if (my !== obsToken) return; fieldCache = F;
+        const F = await fetchField(p.ra_deg, p.dec_deg, fov, inputP.ra_deg, inputP.dec_deg);
+        if (my !== obsToken) return; fieldCache = F; fieldCache.key = key;
       }
       const F = fieldCache;
       setStatus(F.synthetic ? "OFFLINE: archives unreachable → synthetic star field (check your network and try again)" :
-        (demoField(p.ra_deg, p.dec_deg) && !DEMO.rec ? `SAVED DEMO PACK · real archive data · ${F.gaia.length} Gaia stars · instant` :
+        (demoHit ? `SAVED DEMO PACK · real archive data · ${F.gaia.length} Gaia stars · instant` :
         `${/cache/.test(F.gaiaSrc) ? "CACHED (archives unreachable)" : "LIVE"} ${F.gaiaSrc}: ${F.gaia.length} Gaia stars · AllWISE loads in background${window._resolvedVia ? " · " + window._resolvedVia : ""}`), !F.synthetic);
       model = buildModel(p, fov, Object.assign({ targetKey: currentTargetKey }, readFilters()));
       resetSurvey(); updateAll(true);
@@ -1302,7 +1353,7 @@
       $("bar-range").style.width = Math.max(1.5, Math.min(100, tR / tRaw * 100)) + "%";
     }
     async function syncIRSA(manual) {
-      const el = $("irsa-sync"); el.innerText = "checking IRSA for SPHEREx tables…";
+      const el = $("irsa-sync"); el.innerText = "checking IRSA TAP for SPHEREx tables…";
       const now = "just now";
       try {
         let rows, rels = [];
@@ -1764,7 +1815,7 @@
       const el = $("real-notice"); if (!el) return;
       let t = "";
       if (dataMode === "real") {
-        if (realState === "loading") t = "Loading real SPHEREx exposures from IRSA… the simulation is shown until they arrive (first time per field: 10–60 s).";
+        if (realState === "loading") t = "Loading real SPHEREx exposures from IRSA… the simulation is shown until they arrive (first time per field: it can take a few minutes).";
         else if (realState === "error") t = realErr;
         else if (realState === "empty") t = realErr || "SPHEREx has not observed this position in the public releases yet.";
       }
@@ -1772,11 +1823,14 @@
     }
     function ensureRealField() {
       if (dataMode !== "real" || !model || !apiUp()) { realNotice(); return; }
-      const key = `${model.ra.toFixed(5)}|${model.dec.toFixed(5)}|${model.fov}`;
+      const ast = activeAstrometry, hasAst = ast && ast.pmra != null && ast.pmdec != null;
+      const key = `${model.ra.toFixed(5)}|${model.dec.toFixed(5)}|${model.fov}|${hasAst ? ast.pmra.toFixed(2) : 0}|${hasAst ? ast.pmdec.toFixed(2) : 0}|${hasAst ? (ast.ref_epoch || 2000.0) : 2000.0}`;
       if (key === realKey) { realNotice(); return; }
       realKey = key; realField = null; realState = "loading"; connReset("spx"); realNotice();
       const myKey = key, t0 = performance.now();
-      fetchJSON(`${backendBase()}/api/spherex/field?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}`, 240000)
+      const astQ = hasAst
+        ? `&pmra=${encodeURIComponent(ast.pmra)}&pmdec=${encodeURIComponent(ast.pmdec)}&epoch=2026.0` : "";
+      fetchJSON(`${backendBase()}/api/spherex/field?ra=${model.ra}&dec=${model.dec}&fov=${model.fov}${astQ}`, 280000)
         .then(j => {
           if (myKey !== realKey) return;
           (j.errors || []).slice(0, 3).forEach(e => logLine("WARN", "SPHEREx: " + e));
@@ -1791,7 +1845,15 @@
           logLine("OK  ", `Real SPHEREx: ${j.frames.length} exposures (D${[...new Set(j.frames.map(f => f.det))].join(",D")}) of ${j.n_available} available, visits ${fmtMJD(j.epochs_mjd[0])} and ${fmtMJD(j.epochs_mjd[1])}${j.cached ? " (cached)" : ""} in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
           updateAll(true);
         })
-        .catch(e => { if (myKey !== realKey) return; realState = "error"; realErr = (/50[234]|timeout|abort|Proxy|fetch/i.test(String(e && (e.message || e.name))) ? "NASA’s IRSA archive did not answer in time (it is busy or slow right now). Press “Real SPHEREx data” again in a minute." : "Real SPHEREx data could not be loaded for this position.") + " The simulated field is shown instead."; logLine("WARN", realErr); realNotice(); updateAll(false); });
+        .catch(e => { if (myKey !== realKey) return; realState = "error";
+          const raw = String(e && (e.message || e.name) || "");
+          const why = connShort(raw);
+          const advice = why === "timed out" ? "IRSA did not finish the SPHEREx request before the timeout. Retry in a moment." :
+            why === "service unavailable" ? "IRSA is temporarily unavailable or unreachable. Retry in a moment." :
+            why === "archive / query error" ? "IRSA returned an archive or query error. Check the server diagnostic details before retrying." :
+            "The SPHEREx archive request could not be completed.";
+          realErr = advice + " The simulated field is shown instead.";
+          logLine("WARN", realErr + (raw ? " [" + raw.slice(0, 220) + "]" : "")); realNotice(); updateAll(false); });
     }
     function realStack(dets, ep) {
       const fr = realField.frames.filter(f => f.epoch === ep && dets.includes(f.det)); if (!fr.length) return null;
@@ -1885,11 +1947,16 @@
     };
     let deepTok = 0;
     function fetchDeepSpectrum(x, y) {
-      const s = px2sky(x + .5, y + .5), key = `${s.ra.toFixed(4)}|${s.dec.toFixed(4)}`, my = ++deepTok;
+      const s = px2sky(x + .5, y + .5), aKey = activeAstrometry && activeAstrometry.pmra != null && activeAstrometry.pmdec != null ? `${activeAstrometry.pmra.toFixed(2)}|${activeAstrometry.pmdec.toFixed(2)}|${activeAstrometry.ref_epoch || 2000.0}` : "no-pm", key = `${s.ra.toFixed(4)}|${s.dec.toFixed(4)}|${aKey}`, my = ++deepTok;
       const done = j => { if (my !== deepTok || !realReady()) return; if (!j.points || !j.points.length) { logLine("WARN", `Real spectrum: no usable exposures (${j.n_errors || 0} errors)`); return; }
         realSpecCache[key] = j; activeSpec = realSpecObj(x, y, j.points, true); activeClass = classifySpectrum(activeSpec); _simSetSpectrum(activeSpec, `real spectrum · ${j.points.length} of ${j.n_available} SPHEREx exposures`); renderSpectrum(); };
       if (realSpecCache[key]) return done(realSpecCache[key]);
-      fetchJSON(`${backendBase()}/api/spherex/spectrum?ra=${s.ra}&dec=${s.dec}&n=110`, 420000)
+      const a = activeAstrometry && activeAstrometry.pmra != null && activeAstrometry.pmdec != null ? activeAstrometry : null;
+      const aEpoch = a ? (a.ref_epoch || 2000.0) : 2000.0, dtA = ((dataMode === "real" && realField && realField.epochs_mjd && realField.epochs_mjd[1]) ? 2000 + (realField.epochs_mjd[1] - 51544.5) / 365.25 : 2025.9) - aEpoch, cA = a ? Math.max(1e-6, Math.cos(a.dec * D2R)) : 1;
+      const aPos = a ? { ra: (a.ra + a.pmra / 3600000 * dtA / cA + 360) % 360, dec: a.dec + a.pmdec / 3600000 * dtA } : null;
+      const useA = aPos && Math.hypot(((s.ra - aPos.ra + 540) % 360 - 180) * Math.cos(aPos.dec * D2R) * 3600, (s.dec - aPos.dec) * 3600) < 30;
+      const specRa = useA ? a.ra : s.ra, specDec = useA ? a.dec : s.dec;
+      fetchJSON(`${backendBase()}/api/spherex/spectrum?ra=${specRa}&dec=${specDec}&n=110${useA ? `&pmra=${encodeURIComponent(a.pmra)}&pmdec=${encodeURIComponent(a.pmdec)}&epoch=${encodeURIComponent(a.ref_epoch || 2000.0)}` : ""}`, 420000)
         .then(j => { logLine("OK  ", `Real spectrum at ${degToHMS(s.ra)} ${degToDMS(s.dec)}: ${j.n_used} exposures${j.cached ? " (cached)" : ""}${j.n_errors ? `, ${j.n_errors} unreadable` : ""}`); done(j); })
         .catch(e => { logLine("WARN", "Full real spectrum: " + (e && e.name === "AbortError" ? "IRSA needed more than 7 minutes for ~110 exposures from this network - the spectrum from the loaded exposures stays on screen; click the pixel again to retry (finished exposures are cached)" : e.message)); if (my === deepTok && activeSpec && activeSpec.real) { $("spec-subtitle").innerText = $("spec-subtitle").innerText.replace(/ — fetching the full spectrum…/, " — full spectrum not available yet"); } });
     }
@@ -2197,7 +2264,9 @@
       if (dataMode === "real" && realField && realField.n_available != null) { el.innerHTML = `This field: <b>${realField.n_available}</b> SPHEREx images (from the real-data query).`; return; }
       if (!apiUp()) { el.textContent = ""; return; }
       el.textContent = "Counting SPHEREx images at this position…";
-      try { const j = await fetchJSON(`${backendBase()}/api/spherex/coverage-point?ra=${model.ra.toFixed(5)}&dec=${model.dec.toFixed(5)}`, 70000);
+      try { const ast = activeAstrometry, astQ = ast && ast.pmra != null && ast.pmdec != null
+          ? `&pmra=${encodeURIComponent(ast.pmra)}&pmdec=${encodeURIComponent(ast.pmdec)}&epoch=2026.0` : "";
+        const j = await fetchJSON(`${backendBase()}/api/spherex/coverage-point?ra=${model.ra.toFixed(5)}&dec=${model.dec.toFixed(5)}${astQ}`, 70000);
         el.innerHTML = `This field: <b style="color:#D9F94A">${j.n_images}</b> SPHEREx images${j.mjd_first ? ` between ${fmtMJD(j.mjd_first)} and ${fmtMJD(j.mjd_last)}` : ""}.`; }
       catch (e) { el.innerHTML = `<span style="color:#9A95C0">Image count for this field unavailable (${escH(e.message)}).</span>`; }
     }
@@ -2227,37 +2296,62 @@
     async function crossCheckWISE() {
       const el = $("xm-result"); if (!model) return;
       if (!apiUp()) { el.innerHTML = "The NEOWISE + CatWISE check needs the CHRONOS-102 data server (IRSA does not answer browsers directly)."; return; }
-      const T = xmTarget(), muM = T.r ? T.r.mu : 0, rad = Math.min(300, Math.max(muM ? 45 : 90, T.sep + 40, muM * 12 + 30)), ra = T.s0 ? (T.s0.ra + T.s1.ra) / 2 : T.s1.ra, dec = T.s0 ? (T.s0.dec + T.s1.dec) / 2 : T.s1.dec;
+      const T = xmTarget(), muM = T.r ? T.r.mu : 0;
+      const rad = Math.min(300, Math.max(muM ? 45 : 90, T.sep + 40, muM * 12 + 30));
+      const tSph = (dataMode === "real" && realField && realField.epochs_mjd && realField.epochs_mjd[1]) ? 2000 + (realField.epochs_mjd[1] - 51544.5) / 365.25 : 2025.9;
+      const candidateAst = activeAstrometry && activeAstrometry.pmra != null && activeAstrometry.pmdec != null ? activeAstrometry : null;
+      const astAt = (a, epoch) => { if (!a) return null; const dt = epoch - (a.ref_epoch || 2000.0), cd = Math.max(1e-6, Math.cos(a.dec * D2R)); return { ra: (a.ra + (a.pmra / 3600000) * dt / cd + 360) % 360, dec: Math.max(-90, Math.min(90, a.dec + (a.pmdec / 3600000) * dt)) }; };
+      const predictedAst = astAt(candidateAst, tSph);
+      const selectedByUser = !!((ruler.p0 && ruler.p1) || (typeof inspectPt !== "undefined" && inspectPt));
+      const astSeparation = predictedAst ? Math.hypot(((T.s1.ra - predictedAst.ra + 540) % 360 - 180) * Math.cos(predictedAst.dec * D2R) * 3600, (T.s1.dec - predictedAst.dec) * 3600) : Infinity;
+      const ast = candidateAst && (!selectedByUser || astSeparation < Math.max(20, 3 * (model.scale || 6.15))) ? candidateAst : null;
+      const ra = ast ? ast.ra : (T.s0 ? (T.s0.ra + T.s1.ra) / 2 : T.s1.ra);
+      const dec = ast ? ast.dec : (T.s0 ? (T.s0.dec + T.s1.dec) / 2 : T.s1.dec);
+      const queryPMRA = ast ? ast.pmra : (T.r ? T.r.mu * Math.sin(T.r.pa * D2R) * 1000 : 0);
+      const queryPMDec = ast ? ast.pmdec : (T.r ? T.r.mu * Math.cos(T.r.pa * D2R) * 1000 : 0);
+      const queryEpoch = ast ? (ast.ref_epoch || 2000.0) : tSph;
       const tok = ++xmToken; connReset("neo");
-      el.innerHTML = `Step 1/2 · CatWISE2020 proper motions within ${rad.toFixed(0)}″ of ${degToHMS(ra)} ${degToDMS(dec)}…`;
-      let j; try { j = await fetchJSON(`${backendBase()}/api/xmatch?mode=catwise&ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=${rad.toFixed(0)}`, 170000); }
+      el.innerHTML = `Step 1/2 · CatWISE2020 proper motions within 60″ of ${degToHMS(ra)} ${degToDMS(dec)}…`;
+      let j; try { j = await fetchJSON(`${backendBase()}/api/xmatch?mode=catwise&ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=60&pmra=${queryPMRA.toFixed(3)}&pmdec=${queryPMDec.toFixed(3)}&t0=${queryEpoch.toFixed(3)}`, 90000); }
       catch (e) { if (tok !== xmToken) return; el.innerHTML = `<span style="color:#F5C76A">IRSA check: ${escH(slowMsg(e.message))}</span>`; logLine("WARN", "NEOWISE/CatWISE cross-check: " + e.message); return; }
       if (tok !== xmToken) return;
       const cosd = Math.cos(dec * D2R), off = (r_, d_) => [(r_ - ra) * cosd * 3600, (d_ - dec) * 3600]; // +x = east
-      const tSph = (dataMode === "real" && realField && realField.epochs_mjd) ? 2000 + (realField.epochs_mjd[1] - 51544.5) / 365.25 : 2025.9;
-      const meas = T.r ? { mu: T.r.mu, pa: T.r.pa } : null, tgt = off(T.s1.ra, T.s1.dec), tg0 = T.s0 ? off(T.s0.ra, T.s0.dec) : tgt;
+      const meas = T.r ? { mu: T.r.mu, pa: T.r.pa } : null;
+      const targetAtEpoch = ast ? astAt(ast, tSph) : null;
+      const tgt = targetAtEpoch ? off(targetAtEpoch.ra, targetAtEpoch.dec) : off(T.s1.ra, T.s1.dec);
+      const tg0 = T.s0 ? off(T.s0.ra, T.s0.dec) : tgt;
       const segDist = (px, py) => { const ax = tg0[0], ay = tg0[1], bx = tgt[0] - ax, by = tgt[1] - ay, L2 = bx * bx + by * by, t = L2 ? Math.max(0, Math.min(1, ((px - ax) * bx + (py - ay) * by) / L2)) : 0; return Math.hypot(px - ax - t * bx, py - ay - t * by); };
       // CatWISE: propagate every source from its epoch (≈2015.4) to the SPHEREx epoch and find the one landing on the detection
-      const cat = (j.catwise || []).map(s => { const [x0, y0] = off(s.ra, s.dec), pmx = (s.pmra || 0), pmy = (s.pmdec || 0), dt = tSph - 2015.4;
-        const xs = x0 + pmx * dt, ys = y0 + pmy * dt, mu = Math.hypot(pmx, pmy), e = Math.hypot(s.e_pmra || 0, s.e_pmdec || 0) || 0.05;
-        return { ...s, x0, y0, xs, ys, mu, pa: (Math.atan2(pmx, pmy) / D2R + 360) % 360, sig: mu / e, dist: segDist(xs, ys) }; }).sort((a, b) => a.dist - b.dist);
+      const wiseCandidates = [...(j.catwise || []), ...(j.allwise || [])];
+      const cat = wiseCandidates.map(s => {
+        const [x0, y0] = off(s.ra, s.dec), isAllwise = s.catalog === "AllWISE";
+        const closeToTarget = s.separation_arcsec == null || s.separation_arcsec < 8;
+        const targetPmFallback = !!(ast && closeToTarget && (isAllwise || !s.has_pm));
+        const pmx = targetPmFallback ? ast.pmra / 1000 : (s.pmra || 0), pmy = targetPmFallback ? ast.pmdec / 1000 : (s.pmdec || 0);
+        const sourceEpoch = s.epoch || (isAllwise ? 2010.5 : 2015.4), dt = tSph - sourceEpoch;
+        const xs = x0 + pmx * dt, ys = y0 + pmy * dt, mu = Math.hypot(pmx, pmy), e = targetPmFallback ? Infinity : (Math.hypot(s.e_pmra || 0, s.e_pmdec || 0) || 0.05);
+        return { ...s, x0, y0, xs, ys, mu, pm_source: targetPmFallback ? "target_astrometry" : (s.has_pm ? "catalog" : "unknown"), pa: (Math.atan2(pmx, pmy) / D2R + 360) % 360, sig: targetPmFallback ? 0 : mu / e, dist: segDist(xs, ys) };
+      }).sort((a, b) => a.dist - b.dist);
       const meas0 = T.r ? { mu: T.r.mu, pa: T.r.pa } : null;
       const agree0 = (a, b) => b && a && Math.abs(a.mu - b.mu) <= Math.max(0.35 * b.mu, 0.3) && (Math.min(Math.abs(a.pa - b.pa), 360 - Math.abs(a.pa - b.pa)) <= 45 || b.mu < 0.3);
       let best = cat.find(s => s.dist < Math.max(14, 2.5 * model.scale)), byMotion = false;
       if ((!best || !(best.sig > 3 && agree0(best, meas0))) && meas0 && meas0.mu > 0.3) { // no positional match: a significant CatWISE mover in the field with the same motion
         const pm = cat.filter(s => s.sig > 5 && s.mu > 0.3 && agree0(s, meas0)).sort((a, b) => a.dist - b.dist)[0]; if (pm) { best = pm; byMotion = true; } }
       // NEOWISE: keep exposures near the predicted track (seed with CatWISE or the SPHEREx motion), then fit
-      let seed = best ? { vx: best.pmra || 0, vy: best.pmdec || 0, x: best.xs, y: best.ys } : meas ? { vx: meas.mu * Math.sin(meas.pa * D2R), vy: meas.mu * Math.cos(meas.pa * D2R), x: tgt[0], y: tgt[1] } : { vx: 0, vy: 0, x: tgt[0], y: tgt[1] };
+      let seed = best ? { vx: best.pmra || 0, vy: best.pmdec || 0, x: best.xs, y: best.ys, epoch: tSph }
+        : ast ? { vx: ast.pmra / 1000, vy: ast.pmdec / 1000, x: 0, y: 0, epoch: ast.ref_epoch || 2000.0 }
+        : meas ? { vx: meas.mu * Math.sin(meas.pa * D2R), vy: meas.mu * Math.cos(meas.pa * D2R), x: tgt[0], y: tgt[1], epoch: tSph }
+        : { vx: 0, vy: 0, x: tgt[0], y: tgt[1], epoch: tSph };
       // step 2: NEOWISE exposures in a corridor along the expected 2013-2024 track (or a small circle for a static source)
-      el.innerHTML = `Step 2/2 · NEOWISE exposures 2013–2024 along the expected track${best ? ` of CatWISE ${escH(best.name)}` : ""}…`;
+      el.innerHTML = `Step 2/2 · NEOWISE exposures 2013–2024 along the expected track${best ? ` of ${escH(best.catalog || "CatWISE")} ${escH(best.name)}` : ""}…`;
       const sRa = ra + seed.x / 3600 / cosd, sDec = dec + seed.y / 3600, fast = Math.hypot(seed.vx, seed.vy) > 40; // >40″/yr: a solar-system body, no fixed track
       let jn = { neowise: [], errors: [] };
-      if (!fast) try { jn = await fetchJSON(`${backendBase()}/api/xmatch?mode=neowise&ra=${sRa.toFixed(6)}&dec=${sDec.toFixed(6)}&radius=${rad.toFixed(0)}&pmra=${seed.vx.toFixed(4)}&pmdec=${seed.vy.toFixed(4)}&t0=${tSph.toFixed(3)}`, 200000); }
+      if (!fast) try { jn = await fetchJSON(`${backendBase()}/api/xmatch?mode=neowise&ra=${sRa.toFixed(6)}&dec=${sDec.toFixed(6)}&radius=60&pmra=${(seed.vx * 1000).toFixed(3)}&pmdec=${(seed.vy * 1000).toFixed(3)}&t0=${(seed.epoch || tSph).toFixed(3)}`, 90000); }
         catch (e) { jn = { neowise: [], errors: ["NEOWISE-R: " + e.message] }; }
       if (tok !== xmToken) return;
       j.neowise = jn.neowise || []; j.errors = (j.errors || []).concat(jn.errors || []); if (jn.neowise_truncated) j.errors.push("NEOWISE result truncated at 5000 rows");
       const neoAll = j.neowise.filter(p => p.ra != null && p.mjd != null).map(p => { const [x, y] = off(p.ra, p.dec); return { x, y, t: 2000 + (p.mjd - 51544.5) / 365.25, w2: p.w2 }; });
-      let near = neoAll.filter(p => Math.hypot(p.x - (seed.x + seed.vx * (p.t - tSph)), p.y - (seed.y + seed.vy * (p.t - tSph))) < 9 + (best ? 0 : 0.15 * Math.abs(p.t - tSph) * Math.hypot(seed.vx, seed.vy))), fit = fitMotion(near, tSph);
+      let near = neoAll.filter(p => Math.hypot(p.x - (seed.x + seed.vx * (p.t - (seed.epoch || tSph))), p.y - (seed.y + seed.vy * (p.t - (seed.epoch || tSph)))) < 9 + (best ? 0 : 0.15 * Math.abs(p.t - (seed.epoch || tSph)) * Math.hypot(seed.vx, seed.vy))), fit = fitMotion(near, tSph);
       for (let k = 0; k < 2 && fit; k++) { near = neoAll.filter(p => Math.hypot(p.x - (fit.x0 + fit.vx * p.t), p.y - (fit.y0 + fit.vy * p.t)) < Math.max(4, 3 * fit.rms)); fit = fitMotion(near, tSph); }
       const epochs = new Set(near.map(p => Math.round(p.t * 2))).size;
       // verdict
@@ -2268,16 +2362,22 @@
       if (meas && meas.mu > 0.05) {
         if (best && best.sig > 3 && agree(best, meas)) { verdict = byMotion ? `Confirmed mover: CatWISE ${best.name} in this field has the same motion (measured 10 years earlier)` : "Confirmed mover: CatWISE measured the same motion 10 years earlier"; col = "#5FD3A6"; }
         else if (neoMotion && agree(neoMotion, meas) && neoMotion.mu > 3 * fit.err) { verdict = "Confirmed mover: NEOWISE exposures follow the same track"; col = "#5FD3A6"; }
+        else if (best && best.pm_source === "target_astrometry") { verdict = "WISE counterpart found; the NEOWISE track uses resolved target astrometry, not an independent WISE proper-motion measurement"; col = "#F5C76A"; }
+        else if (best && best.pm_source === "unknown") { verdict = "WISE counterpart found, but this catalogue row has no usable proper-motion measurement"; col = "#F5C76A"; }
+        else if (best && best.catalog === "AllWISE") { verdict = "AllWISE counterpart found; verify its motion independently with NEOWISE or SPHEREx"; col = "#F5C76A"; }
         else if (best && best.mu < 0.1 && best.dist < 8) { verdict = "Static infrared source here: the SPHEREx change is more likely variability or a residual"; col = "#F5C76A"; }
         else if (!best && near.length < 3) { verdict = meas.mu > 40 ? "Not in WISE along this track: expected for a solar-system body (it moves too far between WISE visits) - check JPL" : "Not seen by WISE: either fainter than W2 ≈ 16, very red only at SPHEREx wavelengths, or an artifact"; col = "#F58FC8"; }
         else { verdict = "Inconclusive: WISE sees a source but its motion does not match the SPHEREx measurement"; col = "#F5C76A"; }
       } else {
-        if (best && best.sig > 5 && best.mu > 0.1) { verdict = `Known infrared mover nearby: CatWISE μ = ${best.mu.toFixed(2)} ″/yr`; col = "#5FD3A6"; }
+        if (best && best.sig > 5 && best.mu > 0.1) { verdict = `Known infrared mover nearby: ${best.catalog || "CatWISE"} μ = ${best.mu.toFixed(2)} ″/yr`; col = "#5FD3A6"; }
+        else if (best && best.pm_source === "target_astrometry") { verdict = "WISE counterpart found; proper motion comes from the resolved target, not an independent WISE measurement"; col = "#C3CEDF"; }
+        else if (best && best.pm_source === "unknown") { verdict = "WISE counterpart found, but no usable catalogue proper motion is available"; col = "#C3CEDF"; }
+        else if (best && best.catalog === "AllWISE") { verdict = "AllWISE counterpart found; proper motion is not independently measured by this fallback"; col = "#C3CEDF"; }
         else if (best) { verdict = "Static WISE counterpart: compare SPHEREx brightness with W1/W2 for variability"; col = "#C3CEDF"; }
         else { verdict = "No WISE counterpart at this position"; col = "#9A95C0"; }
       }
       if (meas) why.push(`SPHEREx: μ ${meas.mu.toFixed(2)} ″/yr at PA ${meas.pa.toFixed(0)}°`);
-      if (best) why.push(`CatWISE ${best.name}: μ ${best.mu.toFixed(2)} ± ${(best.mu / Math.max(best.sig, 1e-3)).toFixed(2)} ″/yr, PA ${best.pa.toFixed(0)}°, W2 ${best.w2 != null ? best.w2.toFixed(2) : "?"}, ${byMotion ? `matched by motion, ${best.dist.toFixed(0)}″ from the marked position` : `lands ${best.dist.toFixed(1)}″ from the detection`}`);
+      if (best) why.push(best.pm_source === "target_astrometry" ? `${best.catalog || "WISE"} ${best.name}: W1 ${best.w1 != null ? best.w1.toFixed(2) : "?"}, W2 ${best.w2 != null ? best.w2.toFixed(2) : "?"}; target motion comes from the resolved astrometry, not an independent WISE PM` : best.pm_source === "unknown" ? `${best.catalog || "WISE"} ${best.name}: W1 ${best.w1 != null ? best.w1.toFixed(2) : "?"}, W2 ${best.w2 != null ? best.w2.toFixed(2) : "?"}; no usable catalogue PM in this response` : best.catalog === "AllWISE" ? `AllWISE ${best.name}: W1 ${best.w1 != null ? best.w1.toFixed(2) : "?"}, W2 ${best.w2 != null ? best.w2.toFixed(2) : "?"}; no independent proper motion in this fallback` : `${best.catalog || "CatWISE"} ${best.name}: μ ${best.mu.toFixed(2)} ± ${(best.mu / Math.max(best.sig, 1e-3)).toFixed(2)} ″/yr, PA ${best.pa.toFixed(0)}°, W2 ${best.w2 != null ? best.w2.toFixed(2) : "?"}, ${byMotion ? `matched by motion, ${best.dist.toFixed(0)}″ from the marked position` : `lands ${best.dist.toFixed(1)}″ from the detection`}`);
       if (fit && near.length >= 3) why.push(`NEOWISE: ${near.length} exposures in ${epochs} visits over ${fit.span.toFixed(1)} yr → μ ${fit.mu.toFixed(2)} ± ${fit.err.toFixed(2)} ″/yr, PA ${fit.pa.toFixed(0)}°, scatter ${fit.rms.toFixed(1)}″`);
       else why.push(`NEOWISE: ${neoAll.length} exposures in the circle, ${near.length} on the track`);
       if (j.errors && j.errors.length) why.push("partial: " + j.errors.join("; "));
