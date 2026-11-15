@@ -15,7 +15,8 @@ import sys
 import time
 import threading
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import requests
@@ -197,7 +198,7 @@ def parse_coordinates(ra_input: str, dec_input: str) -> Tuple[float, float]:
 # -------------------------------------------------------------------------
 # LIVE NASA / IPAC IRSA & ESA GAIA ARCHIVE QUERY ENGINE
 # -------------------------------------------------------------------------
-UA = {"User-Agent": "CHRONOS-102 (SPHEREx citizen-science tool)"}
+UA = {"User-Agent": "CHRONOS-102-V7.3/1.0"}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SITE_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "website"))   # the folder that is published
 DEMO_DIR = os.path.join(SITE_DIR, "demo")
@@ -232,7 +233,7 @@ def _host(url: str) -> str:
     return url.split("/")[2]
 
 
-CORE_HOSTS = {"gea.esac.esa.int", "gaia.ari.uni-heidelberg.de", "irsa.ipac.caltech.edu"}  # slow but essential: never skipped
+CORE_HOSTS = {"gea.esac.esa.int", "gaia.ari.uni-heidelberg.de", "irsa.ipac.caltech.edu", "cds.unistra.fr", "cdsweb.u-strasbg.fr", "vizier.cfa.harvard.edu", "ned.ipac.caltech.edu"}  # slow but essential: never skipped
 
 
 def _get(url, params=None, timeout=20.0, retries=1, headers_extra=None, **kw):
@@ -263,10 +264,30 @@ def _get_raw(url, params=None, timeout=20.0, retries=1, headers_extra=None, **kw
                 time.sleep(2.0 * (i + 1))
                 continue
             return r
-        except requests.ConnectionError as exc:
+        except (requests.ConnectionError, requests.Timeout) as exc:
             last = exc
             if i < retries:
-                time.sleep(1.5)
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise
+    raise last
+
+
+def _post(url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw):
+    """POST using the shared HTTP session; used for IRSA asynchronous TAP job submission."""
+    last = None
+    for i in range(retries + 1):
+        try:
+            r = _SESSION.post(url, data=data, timeout=(min(8.0, timeout), timeout),
+                              headers=dict(UA, **(headers_extra or {})), verify=VERIFY, **kw)
+            if r.status_code in (502, 503, 504) and i < retries:
+                time.sleep(2.0 * (i + 1))
+                continue
+            return r
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = exc
+            if i < retries:
+                time.sleep(1.5 * (i + 1))
                 continue
             raise
     raise last
@@ -311,57 +332,6 @@ def _s3_release_probe() -> str:
     return "releases: " + (", ".join(found) if found else "none listed")
 
 
-IRSA_GATOR = "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query"
-
-
-def _ipac_value(s):
-    s = (s or "").strip()
-    if s == "" or s.lower() in ("null", "nan", "---"):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return s
-
-
-def _ipac_table(text: str) -> List[Dict]:
-    """Reads an IPAC ASCII table (what Gator returns) into a list of dicts."""
-    lines = [ln.rstrip("\r\n") for ln in text.splitlines() if ln.strip()]
-    heads = [ln for ln in lines if ln.lstrip().startswith("|")]
-    data = [ln for ln in lines if not ln.lstrip().startswith("\\") and not ln.lstrip().startswith("|")]
-    if not heads:
-        return []
-    cuts = [i for i, ch in enumerate(heads[0]) if ch == "|"]
-    cols = [heads[0][cuts[i] + 1:cuts[i + 1]].strip() for i in range(len(cuts) - 1)]
-    rows = []
-    for ln in data:
-        pad = ln.ljust(cuts[-1])
-        rows.append({c: _ipac_value(pad[cuts[i] + 1:cuts[i + 1]]) for i, c in enumerate(cols)})
-    return rows
-
-
-def _gator_cone(catalog: str, ra: float, dec: float, radius_arcsec: float, selcols: str, timeout: float = 60.0) -> List[Dict]:
-    """Cone search through IRSA Gator (the same method that answers in a few seconds)."""
-    params = {"catalog": catalog, "spatial": "cone", "objstr": f"{ra:.6f} {dec:.6f}", "radius": f"{radius_arcsec:.3f}",
-              "radunits": "arcsec", "outfmt": 1, "selcols": selcols}
-    r = _get(IRSA_GATOR, params, timeout, 2)
-    r.raise_for_status()
-    head = r.text[:600]
-    if 'stat="ERROR"' in head or head.lstrip().startswith("<"):
-        m = re.search(r'msg="([^"]*)"', head)
-        raise RuntimeError("IRSA Gator: " + (m.group(1) if m else re.sub(r"\s+", " ", head)[:160]))
-    return _ipac_table(r.text)
-
-
-def _sep_arcsec(ra1, dec1, ra2, dec2):
-    dra = ((ra1 - ra2 + 180.0) % 360.0) - 180.0
-    return math.hypot(dra * math.cos(math.radians(0.5 * (dec1 + dec2))) * 3600.0, (dec1 - dec2) * 3600.0)
-
-
-def _flt(v):
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
-
-
 def _tap_csv(url: str, adql: str, timeout: float = 40.0):
     """CSV TAP query (every TAP service supports it; used for IRSA where JSON replies came back empty). Returns data rows."""
     r = _get(url, {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql}, timeout, retries=2)
@@ -395,17 +365,10 @@ def query_live_archives(ra_deg: float, dec_deg: float, fov_deg: float = 0.10, wh
 
     def do_wise():
         try:
-            try:
-                g = _gator_cone("allwise_p3as_psd", ra_deg, dec_deg, min(radius_deg * 3600.0, 900.0), "designation,ra,dec,w1mpro,w2mpro", 45)
-                g = [x for x in g if _flt(x.get("ra")) is not None and _flt(x.get("dec")) is not None and _flt(x.get("w1mpro")) is not None]
-                g.sort(key=lambda x: x["w1mpro"])
-                rows = [[x.get("designation") or "", x["ra"], x["dec"], x["w1mpro"], "" if x.get("w2mpro") is None else x["w2mpro"]] for x in g[:60]]
-                meta["wise_source"] = "IRSA AllWISE (Gator)"
-            except Exception:  # noqa: BLE001  - backup: the slower TAP service
-                rows = _tap_csv("https://irsa.ipac.caltech.edu/TAP/sync",
-                                f"SELECT TOP 60 designation,ra,dec,w1mpro,w2mpro FROM allwise_p3as_psd "
-                                f"WHERE 1=CONTAINS(POINT('ICRS',ra,dec),{circle}) ORDER BY w1mpro ASC", 40)
-                meta["wise_source"] = "IRSA AllWISE TAP (CSV)"
+            rows = _tap_csv("https://irsa.ipac.caltech.edu/TAP/sync",
+                            f"SELECT TOP 60 designation,ra,dec,w1mpro,w2mpro FROM allwise_p3as_psd "
+                            f"WHERE 1=CONTAINS(POINT('ICRS',ra,dec),{circle}) ORDER BY w1mpro ASC", 60)
+            meta["wise_source"] = "IRSA AllWISE TAP (CSV)"
             out = [{"designation": r[0], "ra": float(r[1]), "dec": float(r[2]), "w1": _f(r[3], 15.0), "w2": _f(r[4], 14.5)} for r in rows if len(r) >= 5]
             if out:
                 _cache_save("wise", ra_deg, dec_deg, fov_deg, out)
@@ -914,39 +877,186 @@ def archives_proxy(ra: float = Query(...), dec: float = Query(...), fov: float =
 
 SESAME_HOSTS = ["https://cds.unistra.fr/cgi-bin/nph-sesame/-oI/SNV?", "https://cdsweb.u-strasbg.fr/cgi-bin/nph-sesame/-oI/SNV?",
                 "https://vizier.cfa.harvard.edu/viz-bin/nph-sesame/-oI/SNV?"]
+CDS_SESAME_XML = "https://cds.unistra.fr/cgi-bin/nph-sesame/-oxp/SNV?"
+IRSA_GATOR = "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query"
+
+# Resolve ambiguous display names through stable SIMBAD/HD identifiers.
+SIMBAD_MAP = {
+    "eps indi a": "HD 209100",
+    "epsilon indi a": "HD 209100",
+    "zeta reticuli": "HD 20766",
+    "alpha centauri": "HD 128620",
+    "61 cygni a": "HD 201091",
+}
+
+CATWISE_EPOCH = 2015.48
+ALLWISE_EPOCH = 2010.5
+NEOWISE_MID_EPOCH = 2019.3
+SPHEREX_EPOCH = 2026.0
+
+
+def propagate_coords(ra_deg: float, dec_deg: float, pmra_mas_yr: float, pmdec_mas_yr: float, dt_years: float):
+    """V7.3 linear proper-motion propagation; PM inputs are in mas/year."""
+    if not pmra_mas_yr and not pmdec_mas_yr:
+        return ra_deg % 360.0, dec_deg
+    cos_dec = max(1e-6, math.cos(math.radians(dec_deg)))
+    dra_deg = (pmra_mas_yr / 3600000.0) * dt_years / cos_dec
+    ddec_deg = (pmdec_mas_yr / 3600000.0) * dt_years
+    return (ra_deg + dra_deg) % 360.0, max(-90.0, min(90.0, dec_deg + ddec_deg))
+
+
+def angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Small-angle separation with RA wrap handling."""
+    dra = (ra1 - ra2 + 180.0) % 360.0 - 180.0
+    cos_dec = math.cos(math.radians(0.5 * (dec1 + dec2)))
+    return math.hypot(dra * cos_dec * 3600.0, (dec1 - dec2) * 3600.0)
+
+
+def _ipac_value(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value or value.lower() in ("null", "nan", "---", "null_value"):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def parse_ipac_table(text: str) -> List[Dict]:
+    """Parse Gator's fixed-width IPAC table output."""
+    lines = [line.rstrip("\r\n") for line in (text or "").splitlines() if line.strip()]
+    header = next((line for line in lines if line.lstrip().startswith("|")), None)
+    if header is None:
+        if (text or "").lstrip().startswith("<"):
+            raise RuntimeError("IRSA Gator returned an HTML error page: " + re.sub(r"\s+", " ", (text or ""))[:180])
+        status = re.search(r"(?im)^\\status\s*=\s*(\S+)", text or "")
+        msg = re.search(r"(?im)^\\msg\s*=\s*(.+)$", text or "")
+        if status and status.group(1).upper() != "OK":
+            raise RuntimeError((msg.group(1).strip() if msg else "IRSA Gator returned an error")[:240])
+        if re.search(r"(?i)(exceeding output table size|\bstatus\s*=\s*error|query failed)", text or ""):
+            raise RuntimeError(re.sub(r"\s+", " ", (text or ""))[:240])
+        return []
+
+    pipe_indices = [i for i, ch in enumerate(header) if ch == "|"]
+    if len(pipe_indices) < 2:
+        return []
+    columns = [header[pipe_indices[i] + 1:pipe_indices[i + 1]].strip().lower()
+               for i in range(len(pipe_indices) - 1)]
+    rows = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(("\\", "|")) or not stripped or set(stripped) <= {"-", " "}:
+            continue
+        padded = line.ljust(pipe_indices[-1] + 1)
+        values = [padded[pipe_indices[i] + 1:pipe_indices[i + 1]].strip()
+                  for i in range(len(pipe_indices) - 1)]
+        if len(values) == len(columns):
+            rows.append({key: _ipac_value(val) for key, val in zip(columns, values)})
+    status = re.search(r"(?im)^\\status\s*=\s*(\S+)", text or "")
+    if status and status.group(1).upper() != "OK":
+        msg = re.search(r"(?im)^\\msg\s*=\s*(.+)$", text or "")
+        raise RuntimeError((msg.group(1).strip() if msg else "IRSA Gator query failed")[:240])
+    return rows
+
+
+def query_gator_cone(catalog: str, ra: float, dec: float, radius_arcsec: float, selcols: str, timeout: float = 25.0) -> List[Dict]:
+    """Query IRSA Gator using the V7.3 cone-search path (IPAC output)."""
+    params = {
+        "catalog": catalog,
+        "spatial": "cone",
+        "objstr": f"{ra:.6f} {dec:.6f}",
+        "radius": f"{max(0.1, float(radius_arcsec)):.3f}",
+        "radunits": "arcsec",
+        "outfmt": 1,
+        "selcols": selcols,
+    }
+    response = _get(IRSA_GATOR, params=params, timeout=timeout, retries=1)
+    response.raise_for_status()
+    return parse_ipac_table(response.text)
+
+
+def _xml_child_text(root, tag: str):
+    wanted = tag.lower()
+    for node in root.iter():
+        if str(node.tag).split("}")[-1].lower() == wanted:
+            value = (node.text or "").strip()
+            if value:
+                return value
+    return None
 
 
 def _resolve(name: str, timeout: float = 8.0) -> Dict:
-    """Races Sesame mirrors, SIMBAD and NED in parallel; first answer wins (CDS hosts are slow on some networks)."""
+    """Resolve object coordinates and CDS Sesame proper motion; preserve legacy fallbacks."""
+    normalized = re.sub(r"\s+", " ", name.strip()).casefold()
+    lookup_name = SIMBAD_MAP.get(normalized, name.strip())
+
+    # Preferred path: the XML Sesame response used by the verified V7.3 pipeline.
+    try:
+        xml_response = _get(CDS_SESAME_XML + urllib.parse.quote(lookup_name), None,
+                            timeout=min(timeout, 8.0), retries=0)
+        xml_response.raise_for_status()
+        root = ET.fromstring(xml_response.content)
+        ra_text = _xml_child_text(root, "jradeg")
+        dec_text = _xml_child_text(root, "jdedeg")
+        if ra_text is not None and dec_text is not None:
+            pmra_text = _xml_child_text(root, "pmRA")
+            pmdec_text = _xml_child_text(root, "pmDE")
+            return {
+                "name": name,
+                "resolved_as": lookup_name,
+                "ra": float(ra_text) % 360.0,
+                "dec": float(dec_text),
+                "pmra": _f(pmra_text, 0.0),
+                "pmdec": _f(pmdec_text, 0.0),
+                "ref_epoch": 2000.0,
+                "pm_unit": "mas/yr",
+                "via": "CDS Sesame XML",
+                "astrometry_source": "CDS Sesame",
+            }
+    except Exception:
+        pass
+
     def sesame(host):
-        r = _get(host + urllib.parse.quote(name), None, timeout, retries=0, allow_redirects=False)
+        r = _get(host + urllib.parse.quote(lookup_name), None, timeout, retries=0, allow_redirects=False)
         if r.status_code in (301, 302, 303, 307, 308):
             raise RuntimeError(f"redirected to {r.headers.get('location', '?')[:50]}")
         for line in r.text.splitlines():
             if line.startswith("%J"):
                 p = line.split()
-                return {"name": name, "ra": float(p[1]), "dec": float(p[2]), "via": host.split("/")[2]}
+                return {"name": name, "resolved_as": lookup_name, "ra": float(p[1]), "dec": float(p[2]),
+                        "pmra": 0.0, "pmdec": 0.0, "ref_epoch": 2000.0, "pm_unit": "mas/yr",
+                        "via": host.split("/")[2]}
         raise RuntimeError("not found")
 
     def simbad():
-        r = requests.post("https://simbad.cds.unistra.fr/simbad/sim-tap/sync", timeout=timeout, headers=UA, verify=VERIFY,
-                          data={"request": "doQuery", "lang": "adql", "format": "json",
-                                "query": "SELECT ra,dec FROM basic JOIN ident ON oidref=oid WHERE id='" + name.replace("'", "''") + "'"})
-        d = r.json().get("data", [])
-        if not d:
+        query = ("SELECT TOP 1 ra,dec,pmra,pmdec,main_id FROM basic JOIN ident ON oidref=oid WHERE id='"
+                 + lookup_name.replace("'", "''") + "'")
+        r = _post("https://simbad.cds.unistra.fr/simbad/sim-tap/sync",
+                  data={"request": "doQuery", "lang": "adql", "format": "json", "query": query},
+                  timeout=timeout, retries=0)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
             raise RuntimeError("not found")
-        return {"name": name, "ra": float(d[0][0]), "dec": float(d[0][1]), "via": "SIMBAD TAP"}
+        row = data[0]
+        return {"name": name, "resolved_as": lookup_name, "ra": float(row[0]), "dec": float(row[1]),
+                "pmra": _f(row[2], 0.0) if len(row) > 2 else 0.0,
+                "pmdec": _f(row[3], 0.0) if len(row) > 3 else 0.0,
+                "ref_epoch": 2000.0, "pm_unit": "mas/yr", "via": "SIMBAD TAP"}
 
     def ned():
-        r = _get("https://ned.ipac.caltech.edu/srs/ObjectLookup", {"name": name, "of": "json"}, timeout, retries=0)
+        r = _get("https://ned.ipac.caltech.edu/srs/ObjectLookup", {"name": lookup_name, "of": "json"}, timeout, retries=0)
+        r.raise_for_status()
         pos = r.json().get("Preferred", {}).get("Position", {})
         if "RA" not in pos:
             raise RuntimeError("not found")
-        return {"name": name, "ra": float(pos["RA"]), "dec": float(pos["Dec"]), "via": "NED"}
+        return {"name": name, "resolved_as": lookup_name, "ra": float(pos["RA"]), "dec": float(pos["Dec"]),
+                "pmra": 0.0, "pmdec": 0.0, "ref_epoch": 2000.0, "pm_unit": "mas/yr", "via": "NED"}
 
     jobs = [(h.split("/")[2], (lambda h=h: sesame(h))) for h in SESAME_HOSTS] + [("SIMBAD", simbad), ("NED", ned)]
     errs = []
-    from concurrent.futures import as_completed
     ex = ThreadPoolExecutor(max_workers=len(jobs))
     futs = {ex.submit(fn): label for label, fn in jobs}
     try:
@@ -964,7 +1074,7 @@ def _resolve(name: str, timeout: float = 8.0) -> Dict:
 
 @app.get("/api/resolve")
 def resolve_name(name: str = Query(..., description="Object name, e.g. Sirius, M42, Wolf 359")):
-    """Resolves an object name (CDS Sesame mirrors -> SIMBAD -> NED)."""
+    """Resolves object coordinates and (when available) proper motion in mas/year."""
     return _resolve(name)
 
 
@@ -1021,7 +1131,14 @@ def irsa_releases():
 import ledger as LEDGER_MOD  # shared, persistent, vote-based ledger (ledger.py)
 import spherex_real as SPX      # real SPHEREx pixels and spectra (spherex_real.py)
 
-SPX.configure(lambda url, params=None, timeout=20.0, retries=1, headers_extra=None: _get(url, params, timeout, retries, headers_extra=headers_extra))
+SPX.configure(
+    lambda url, params=None, timeout=20.0, retries=1, headers_extra=None: _get(url, params, timeout, retries, headers_extra=headers_extra),
+    lambda url, data=None, timeout=20.0, retries=0, headers_extra=None, **kw: _post(
+        url, data, timeout, retries, headers_extra=headers_extra, **kw
+    ),
+    verify=VERIFY,
+    user_agent=UA["User-Agent"],
+)
 LEDGER = LEDGER_MOD.Ledger(os.path.join(DATA_DIR, "ledger.json"), seed=DISCOVERY_LEDGER)
 
 
@@ -1076,21 +1193,36 @@ def vote_on_candidate(cand_id: str, v: Vote, request: Request):
 
 # ---------------- real SPHEREx data ----------------
 @app.get("/api/spherex/field")
-def spherex_field(ra: float = Query(...), dec: float = Query(...), fov: float = Query(6.56)):
-    """Real SPHEREx two-visit images (IMAGE - ZODI) for each detector, resampled to the 64x64 viewer grid."""
+def spherex_field(ra: float = Query(...), dec: float = Query(...), fov: float = Query(6.56),
+                  pmra: float = Query(0.0), pmdec: float = Query(0.0), epoch: float = Query(2000.0)):
+    """Real SPHEREx two-visit images; use the propagated J2026 position for archive discovery while keeping the image grid anchored to the supplied coordinates."""
     try:
-        return JSONResponse(content=SPX.field(ra, dec, min(max(fov, 1.0), 30.0), CACHE_DIR))
+        qra, qdec = propagate_coords(ra, dec, pmra, pmdec, SPHEREX_EPOCH - epoch)
+        return JSONResponse(content=SPX.field(ra, dec, min(max(fov, 1.0), 30.0), CACHE_DIR,
+                                               query_ra=qra, query_dec=qdec))
+    except requests.Timeout as exc:
+        raise HTTPException(status_code=504, detail=f"SPHEREx archive timed out: {type(exc).__name__}: {str(exc)[:200]}")
+    except requests.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"SPHEREx archive temporarily unreachable: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SPHEREx archive: {type(exc).__name__}: {str(exc)[:200]}")
+        raise HTTPException(status_code=502, detail=f"SPHEREx archive/query error: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 @app.get("/api/spherex/spectrum")
-def spherex_spectrum(ra: float = Query(...), dec: float = Query(...), n: int = Query(110)):
-    """Real SPHEREx spectrum at a position from up to n exposures (byte-range reads, a few kB per exposure)."""
+def spherex_spectrum(ra: float = Query(...), dec: float = Query(...), n: int = Query(110),
+                     pmra: float = Query(0.0), pmdec: float = Query(0.0), epoch: float = Query(2000.0)):
+    """Real SPHEREx spectrum sampled along the object's proper-motion track when astrometry is available."""
     try:
-        return JSONResponse(content=SPX.spectrum(ra, dec, CACHE_DIR, max_images=min(max(n, 6), 200)))
+        qra, qdec = propagate_coords(ra, dec, pmra, pmdec, SPHEREX_EPOCH - epoch)
+        return JSONResponse(content=SPX.spectrum(ra, dec, CACHE_DIR, max_images=min(max(n, 6), 200),
+                                                  query_ra=qra, query_dec=qdec,
+                                                  pmra_mas_yr=pmra, pmdec_mas_yr=pmdec, ref_epoch=epoch))
+    except requests.Timeout as exc:
+        raise HTTPException(status_code=504, detail=f"SPHEREx archive timed out: {type(exc).__name__}: {str(exc)[:200]}")
+    except requests.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"SPHEREx archive temporarily unreachable: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"SPHEREx archive: {type(exc).__name__}: {str(exc)[:200]}")
+        raise HTTPException(status_code=502, detail=f"SPHEREx archive/query error: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 # ---------------- known small bodies (JPL) ----------------
@@ -1104,18 +1236,31 @@ def _sexa(v: float, hours: bool) -> str:
 
 @app.get("/api/net-check")
 def net_check():
-    """Shows which archives this server can reach right now (name, HTTP status, milliseconds)."""
+    """Probe the same archive clients used by production endpoints."""
     out = {"region": os.environ.get("VERCEL_REGION", "local"), "archives": {}}
-    for name, url in (("NASA IRSA", "https://irsa.ipac.caltech.edu/TAP/availability"),
-                      ("NASA JPL", "https://ssd-api.jpl.nasa.gov/sbdb.api?sstr=Ceres"),
-                      ("ESA Gaia", "https://gea.esac.esa.int/tap-server/tap/availability"),
-                      ("CDS Sesame", "https://cds.unistra.fr/cgi-bin/nph-sesame/-oI/A?m42")):
+    probes = (
+        ("NASA IRSA Gator", lambda: _get(
+            "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query?catalog=catwise_2020&spatial=cone&objstr=83.822+-5.391&radius=5&radunits=arcsec&outfmt=1&selcols=ra,dec",
+            None, 15, retries=1)),
+        ("NASA JPL", lambda: _get("https://ssd-api.jpl.nasa.gov/sbdb.api?sstr=Ceres", None, 15, retries=1)),
+        ("ESA Gaia", lambda: _get("https://gea.esac.esa.int/tap-server/tap/availability", None, 15, retries=1)),
+        ("CDS Sesame", lambda: _get("https://cds.unistra.fr/cgi-bin/nph-sesame/-oxp/SNV?M42", None, 15, retries=1)),
+    )
+    for name, probe in probes:
         t0 = time.time()
         try:
-            r = requests.get(url, timeout=(8, 15), headers=UA, verify=VERIFY)
-            out["archives"][name] = {"ok": r.status_code == 200, "http": r.status_code, "ms": int((time.time() - t0) * 1000)}
+            response = probe()
+            out["archives"][name] = {"ok": response.status_code == 200, "http": response.status_code,
+                                     "ms": int((time.time() - t0) * 1000)}
         except Exception as exc:  # noqa: BLE001
-            out["archives"][name] = {"ok": False, "error": type(exc).__name__, "ms": int((time.time() - t0) * 1000)}
+            out["archives"][name] = {"ok": False,
+                                     "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+                                     "ms": int((time.time() - t0) * 1000)}
+
+    t0 = time.time()
+    sia = SPX.probe_sia2(83.822, -5.391, timeout=18.0)
+    sia["ms"] = int((time.time() - t0) * 1000)
+    out["archives"]["NASA SPHEREx SIA2"] = sia
     return out
 
 
@@ -1318,117 +1463,170 @@ def spherex_coverage(cell: float = Query(5.0, ge=2.0, le=15.0)):
 
 
 @app.get("/api/spherex/coverage-point")
-def spherex_coverage_point(ra: float = Query(...), dec: float = Query(...)):
-    """Number of SPHEREx spectral images that contain one sky position, and their date range."""
-    key = f"{ra:.3f}|{dec:.3f}"
-    hit = _cache_load_any("covpt", key)
+def spherex_coverage_point(ra: float = Query(...), dec: float = Query(...),
+                           pmra: float = Query(0.0), pmdec: float = Query(0.0), epoch: float = Query(2000.0)):
+    """Count SPHEREx images at the propagated J2026 position using the same SIA2 discovery path as the verified V7.3 test."""
+    qra, qdec = propagate_coords(ra, dec, pmra, pmdec, SPHEREX_EPOCH - epoch)
+    key = f"sia2-v73|{qra:.5f}|{qdec:.5f}"
+    hit = _cache_load_any("covpt_sia2", key)
     if hit is not None:
         return hit
     try:
-        items = SPX.list_images(ra, dec, CACHE_DIR)
+        images = SPX.list_images(qra, qdec, CACHE_DIR)
+    except requests.Timeout as exc:
+        raise HTTPException(status_code=504, detail=f"IRSA SPHEREx SIA2 timed out: {type(exc).__name__}: {str(exc)[:160]}")
+    except requests.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"IRSA SPHEREx SIA2 temporarily unreachable: {type(exc).__name__}: {str(exc)[:160]}")
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"IRSA SPHEREx image list: {type(exc).__name__}: {str(exc)[:160]}")
-    mj = [i["mjd"] for i in items if i.get("mjd")]
-    out = {"ra": ra, "dec": dec, "n_images": len(items), "mjd_first": min(mj) if mj else None, "mjd_last": max(mj) if mj else None,
-           "source": "IRSA SIA2 (SPHEREx collections)"}
-    _cache_save_any("covpt", key, out)
+        raise HTTPException(status_code=502, detail=f"IRSA SPHEREx SIA2 query error: {type(exc).__name__}: {str(exc)[:160]}")
+    mjds = [float(item["mjd"]) for item in images if item.get("mjd") is not None]
+    out = {"ra": qra, "dec": qdec, "input_ra": ra, "input_dec": dec,
+           "n_images": len(images), "mjd_first": min(mjds) if mjds else None,
+           "mjd_last": max(mjds) if mjds else None, "source": "NASA/IPAC IRSA SIA2 (DR1 + QR3)"}
+    if images:
+        _cache_save_any("covpt_sia2", key, out)
     return out
 
 
 @app.get("/api/xmatch")
-def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: float = Query(45.0, ge=5, le=300),
-                       mode: str = Query("both"), pmra: float = Query(0.0), pmdec: float = Query(0.0), t0: float = Query(2025.9)):
-    """CatWISE2020 (proper motions, epoch ~2015.4) and NEOWISE-R single exposures (2013-2024).
-    NEOWISE is searched in a narrow corridor along the expected track (ra, dec at epoch t0 moving with pmra, pmdec in arcsec/yr),
-    or in a small circle when no motion is given, so a dense field never hits the row limit."""
-    key = f"{ra:.5f}|{dec:.5f}|{radius:.0f}|{mode}|{pmra:.3f}|{pmdec:.3f}|{t0:.2f}"
-    hit = _cache_load_any("xmatch2", key)
+def independent_epochs(ra: float = Query(...), dec: float = Query(...), radius: float = Query(60.0, ge=5, le=300),
+                       mode: str = Query("both"), pmra: float = Query(0.0), pmdec: float = Query(0.0), t0: float = Query(2000.0)):
+    """V7.3 WISE cross-match: Gator CatWISE/AllWISE at their catalogue epochs and NEOWISE observations filtered along the propagated proper-motion track. PM inputs are mas/year."""
+    if mode not in ("both", "catwise", "neowise"):
+        raise HTTPException(status_code=400, detail="mode must be 'both', 'catwise', or 'neowise'")
+    key = f"v73|{ra:.5f}|{dec:.5f}|{mode}|{pmra:.2f}|{pmdec:.2f}|{t0:.3f}"
+    hit = _cache_load_any("xmatch_v73", key)
     if hit is not None:
         return hit
-    cosd = max(1e-6, math.cos(math.radians(dec)))
-    out = {"ra": ra, "dec": dec, "radius_arcsec": radius, "catwise": [], "neowise": [], "errors": [], "neowise_region": None}
 
-    def cat():
-        cols = "source_name,ra,dec,w1mpro,w2mpro,pmra,pmdec,sigpmra,sigpmdec"
-        why = ""
+    out = {"ra": ra, "dec": dec, "radius_arcsec": 60.0, "catwise": [], "allwise": [],
+           "neowise": [], "errors": [], "neowise_region": None, "best_wise": None}
+    failures = []
+    allwise_queried = False
+
+    def fail(service, exc):
+        failures.append((service, exc))
+        out["errors"].append(f"{service}: {type(exc).__name__}: {str(exc)[:180]}")
+
+    if mode in ("both", "catwise"):
+        ra_cw, dec_cw = propagate_coords(ra, dec, pmra, pmdec, CATWISE_EPOCH - t0)
         try:
-            g = _gator_cone("catwise_2020", ra, dec, radius, cols, 60)
-            g = [x for x in g if _flt(x.get("ra")) is not None and _flt(x.get("dec")) is not None]
-            g.sort(key=lambda x: _sep_arcsec(ra, dec, x["ra"], x["dec"]))
-            out["catwise"] = [{"name": x.get("source_name"), "ra": x["ra"], "dec": x["dec"], "w1": _flt(x.get("w1mpro")), "w2": _flt(x.get("w2mpro")),
-                               "pmra": _flt(x.get("pmra")), "pmdec": _flt(x.get("pmdec")), "e_pmra": _flt(x.get("sigpmra")), "e_pmdec": _flt(x.get("sigpmdec"))}
-                              for x in g[:500]]
-            return
-        except Exception as exc:  # noqa: BLE001
-            why = f"Gator {type(exc).__name__}: {str(exc)[:90]}"
-        try:  # backup: the slower TAP service
-            circ = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{radius / 3600.0:.6f})"
-            rows = _tap_csv(IRSA_TAP, "SELECT TOP 500 source_name, ra, dec, w1mpro, w2mpro, pmra, pmdec, sigpmra, sigpmdec FROM catwise_2020 "
-                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {circ})", 40)
-            out["catwise"] = [{"name": r[0], "ra": _f(r[1]), "dec": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4]),
-                               "pmra": _f(r[5]), "pmdec": _f(r[6]), "e_pmra": _f(r[7]), "e_pmdec": _f(r[8])} for r in rows]
-        except Exception as exc:  # noqa: BLE001
-            out["errors"].append(f"CatWISE2020: {why}; TAP {type(exc).__name__}: {str(exc)[:80]}")
-
-    def neo():
-        mu = math.hypot(pmra, pmdec)
-
-        def at(t):
-            return ra + pmra * (t - t0) / 3600.0 / cosd, dec + pmdec * (t - t0) / 3600.0
-        if mu > 0.02:  # moving source: a corridor along its expected track over the NEOWISE years
-            cra, cdec = at(2019.05)
-            crad = max(20.0, 5.65 * mu + 15.0)  # half the track length plus the corridor width
-            out["neowise_region"] = {"kind": "corridor", "half_width_arcsec": 12}
-        else:
-            cra, cdec, crad = ra, dec, min(radius, 25.0)
-            out["neowise_region"] = {"kind": "circle", "radius_arcsec": min(radius, 25.0)}
-        why = ""
-        try:
-            g = _gator_cone("neowiser_p1bs_psd", cra, cdec, crad, "ra,dec,mjd,w1mpro,w2mpro", 90)
-            rows = []
-            for x in g:
-                if None in (_flt(x.get("ra")), _flt(x.get("dec")), _flt(x.get("mjd"))) or _flt(x.get("w2mpro")) is None:
+            # Extended motion-aware columns are available in CatWISE2020. If an IRSA mirror
+            # rejects an optional column, retry with the exact four-column V7.3 query.
+            cols = "source_name,w1mpro,w2mpro,ra,dec,ra_pm,dec_pm,PMRA,PMDec,sigPMRA,sigPMDec,w1mpro_pm,w2mpro_pm"
+            try:
+                cw_rows = query_gator_cone("catwise_2020", ra_cw, dec_cw, 60.0, cols, timeout=30)
+            except Exception:
+                cw_rows = query_gator_cone("catwise_2020", ra_cw, dec_cw, 60.0, "w1mpro,w2mpro,ra,dec", timeout=30)
+            for row in cw_rows:
+                rra = _f(row.get("ra_pm"), _f(row.get("ra")))
+                rdec = _f(row.get("dec_pm"), _f(row.get("dec")))
+                if rra is None or rdec is None:
                     continue
-                if mu > 0.02:
-                    ea, ed = at(2000.0 + (x["mjd"] - 51544.5) / 365.25)
-                    if _sep_arcsec(ea, ed, x["ra"], x["dec"]) > 12.0:
-                        continue
-                rows.append({"ra": x["ra"], "dec": x["dec"], "mjd": x["mjd"], "w1": _flt(x.get("w1mpro")), "w2": x["w2mpro"]})
-            rows.sort(key=lambda r: r["mjd"])
-            out["neowise"] = rows[:5000]
-            out["neowise_truncated"] = len(rows) > 5000
-            return
-        except Exception as exc:  # noqa: BLE001
-            why = f"Gator {type(exc).__name__}: {str(exc)[:90]}"
-        try:  # backup: the slower TAP service
-            if mu > 0.02:
-                (ra1, de1), (ra2, de2) = at(2013.4), at(2024.7)
-                ux, uy = (ra2 - ra1) * cosd, de2 - de1
-                n = math.hypot(ux, uy) or 1e-9
-                w = 12.0 / 3600.0
-                px, py = -uy / n * w, ux / n * w
-                ex, ey = ux / n * w, uy / n * w
-                pts = [(ra1 - ex / cosd + px / cosd, de1 - ey + py), (ra2 + ex / cosd + px / cosd, de2 + ey + py),
-                       (ra2 + ex / cosd - px / cosd, de2 + ey - py), (ra1 - ex / cosd - px / cosd, de1 - ey - py)]
-                region = "POLYGON('ICRS'," + ",".join(f"{p[0] % 360:.6f},{p[1]:.6f}" for p in pts) + ")"
-            else:
-                region = f"CIRCLE('ICRS',{ra:.6f},{dec:.6f},{min(radius, 25.0) / 3600.0:.6f})"
-            rows = _tap_csv(IRSA_TAP, "SELECT TOP 5000 ra, dec, mjd, w1mpro, w2mpro FROM neowiser_p1bs_psd "
-                                      f"WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), {region}) AND w2mpro IS NOT NULL", 40)
-            out["neowise"] = [{"ra": _f(r[0]), "dec": _f(r[1]), "mjd": _f(r[2]), "w1": _f(r[3]), "w2": _f(r[4])} for r in rows]
-            out["neowise_truncated"] = len(rows) >= 5000
-        except Exception as exc:  # noqa: BLE001
-            out["errors"].append(f"NEOWISE-R: {why}; TAP {type(exc).__name__}: {str(exc)[:80]}")
+                out["catwise"].append({
+                    "name": row.get("source_name") or row.get("source_id") or f"CatWISE-{len(out['catwise']) + 1}",
+                    "catalog": "CatWISE", "ra": rra, "dec": rdec,
+                    "w1": _f(row.get("w1mpro_pm"), _f(row.get("w1mpro"))),
+                    "w2": _f(row.get("w2mpro_pm"), _f(row.get("w2mpro"))),
+                    # CatWISE PM columns are arcsec/year; this matches the viewer's motion-fit units.
+                    "pmra": _f(row.get("pmra"), 0.0),
+                    "pmdec": _f(row.get("pmdec"), 0.0),
+                    "has_pm": row.get("pmra") is not None and row.get("pmdec") is not None,
+                    "e_pmra": _f(row.get("sigpmra"), 0.05),
+                    "e_pmdec": _f(row.get("sigpmdec"), 0.05),
+                    "epoch": CATWISE_EPOCH,
+                    "separation_arcsec": angular_sep_arcsec(ra_cw, dec_cw, rra, rdec),
+                })
+            out["catwise"].sort(key=lambda item: item["separation_arcsec"])
+            if out["catwise"] and out["catwise"][0].get("w1") is not None:
+                best = out["catwise"][0]
+                out["best_wise"] = {"catalog": "CatWISE", "name": best["name"], "w1": best["w1"],
+                                    "w2": best["w2"], "ra": best["ra"], "dec": best["dec"],
+                                    "separation_arcsec": best["separation_arcsec"]}
+        except Exception as exc:
+            fail("CatWISE2020 (IRSA Gator)", exc)
 
-    jobs = ([cat] if mode in ("both", "catwise") else []) + ([neo] if mode in ("both", "neowise") else [])
-    th = [threading.Thread(target=f) for f in jobs]
-    [t.start() for t in th]
-    [t.join(130) for t in th]
-    out["source"] = "NASA/IPAC IRSA Gator: catwise_2020, neowiser_p1bs_psd"
-    if not out["errors"]:
-        _cache_save_any("xmatch2", key, out)
-    if out["errors"] and not out["catwise"] and not out["neowise"]:
-        raise HTTPException(status_code=502, detail=" | ".join(out["errors"]))
+        # V7.3 fallback: AllWISE is queried when CatWISE has no counterpart or its W1 is saturated/bright.
+        cw_best = out["catwise"][0] if out["catwise"] else None
+        if cw_best is None or cw_best.get("w1") is None or cw_best["w1"] < 4.5:
+            allwise_queried = True
+            ra_aw, dec_aw = propagate_coords(ra, dec, pmra, pmdec, ALLWISE_EPOCH - t0)
+            try:
+                aw_rows = query_gator_cone("allwise_p3as_psd", ra_aw, dec_aw, 60.0,
+                                            "w1mpro,w2mpro,ra,dec", timeout=30)
+                for row in aw_rows:
+                    rra, rdec = _f(row.get("ra")), _f(row.get("dec"))
+                    if rra is None or rdec is None:
+                        continue
+                    out["allwise"].append({
+                        "name": row.get("designation") or f"AllWISE-{len(out['allwise']) + 1}",
+                        "catalog": "AllWISE", "ra": rra, "dec": rdec,
+                        "w1": _f(row.get("w1mpro")), "w2": _f(row.get("w2mpro")),
+                        "pmra": 0.0, "pmdec": 0.0, "has_pm": False, "e_pmra": None, "e_pmdec": None,
+                        "epoch": ALLWISE_EPOCH,
+                        "separation_arcsec": angular_sep_arcsec(ra_aw, dec_aw, rra, rdec),
+                    })
+                out["allwise"].sort(key=lambda item: item["separation_arcsec"])
+                if out["allwise"]:
+                    best = out["allwise"][0]
+                    out["best_wise"] = {"catalog": "AllWISE", "name": best["name"], "w1": best["w1"],
+                                        "w2": best["w2"], "ra": best["ra"], "dec": best["dec"],
+                                        "separation_arcsec": best["separation_arcsec"]}
+            except Exception as exc:
+                fail("AllWISE fallback (IRSA Gator)", exc)
+
+    if mode in ("both", "neowise"):
+        mu_mas = math.hypot(pmra, pmdec)
+        ra_mid, dec_mid = propagate_coords(ra, dec, pmra, pmdec, NEOWISE_MID_EPOCH - t0)
+        neo_radius = max(20.0, 6.0 * (mu_mas / 1000.0) + 10.0)
+        neo_radius = min(300.0, neo_radius)
+        out["neowise_region"] = {"kind": "circle", "radius_arcsec": round(neo_radius, 2),
+                                 "epoch": NEOWISE_MID_EPOCH, "ra": ra_mid, "dec": dec_mid,
+                                 "track_filter_arcsec": 8.0}
+        try:
+            # Keep this deliberately small: the V7.3 four-column query avoids Gator's output-size failures.
+            neo_rows = query_gator_cone("neowiser_p1bs_psd", ra_mid, dec_mid, neo_radius,
+                                        "ra,dec,mjd,w1mpro", timeout=35)
+            accepted = []
+            for row in neo_rows:
+                rra, rdec, mjd = _f(row.get("ra")), _f(row.get("dec")), _f(row.get("mjd"))
+                w1 = _f(row.get("w1mpro"))
+                if rra is None or rdec is None or mjd is None or w1 is None:
+                    continue
+                obs_year = 2000.0 + (mjd - 51544.5) / 365.25
+                exp_ra, exp_dec = propagate_coords(ra, dec, pmra, pmdec, obs_year - t0)
+                sep = angular_sep_arcsec(exp_ra, exp_dec, rra, rdec)
+                if sep < 8.0:
+                    accepted.append({"ra": rra, "dec": rdec, "mjd": mjd, "w1": w1,
+                                     "w2": _f(row.get("w2mpro")), "separation_arcsec": round(sep, 3)})
+            out["neowise"] = accepted
+            out["neowise_candidates"] = len(neo_rows)
+            out["neowise_truncated"] = False
+        except Exception as exc:
+            fail("NEOWISE-R (IRSA Gator)", exc)
+
+    out["source"] = "NASA/IPAC IRSA Gator: catwise_2020, allwise_p3as_psd, neowiser_p1bs_psd"
+    out["astrometry"] = {"pmra_mas_yr": pmra, "pmdec_mas_yr": pmdec, "reference_epoch": t0}
+    out["query_status"] = {
+        "catwise": "error" if any("CatWISE" in name for name, _ in failures) else ("ok" if mode in ("both", "catwise") else "not_requested"),
+        "allwise": "error" if any("AllWISE" in name for name, _ in failures) else ("ok" if allwise_queried else ("not_needed" if mode in ("both", "catwise") else "not_requested")),
+        "neowise": "error" if any("NEOWISE" in name for name, _ in failures) else ("ok" if mode in ("both", "neowise") else "not_requested"),
+    }
+
+    # Cache only complete archive responses; partial results must be retryable.
+    if not failures:
+        _cache_save_any("xmatch_v73", key, out)
+    elif not (out["catwise"] or out["allwise"] or out["neowise"]):
+        statuses = []
+        for _, exc in failures:
+            if isinstance(exc, requests.Timeout):
+                statuses.append(504)
+            elif isinstance(exc, requests.ConnectionError):
+                statuses.append(503)
+            else:
+                statuses.append(502)
+        status = 504 if 504 in statuses else (503 if 503 in statuses else 502)
+        raise HTTPException(status_code=status, detail=" | ".join(out["errors"]))
     return out
 
 
