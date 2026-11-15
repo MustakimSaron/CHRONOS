@@ -38,7 +38,15 @@ TAP = "https://irsa.ipac.caltech.edu/TAP/sync"
 TAP_ASYNC = "https://irsa.ipac.caltech.edu/TAP/async"
 SIA2 = "https://irsa.ipac.caltech.edu/SIA"
 SIA2_COLLECTIONS = ("spherex_dr1", "spherex_qr3", "spherex_dr1_deep", "spherex_qr3_deep")
-S3 = "https://nasa-irsa-spherex.s3.amazonaws.com/"
+
+# Optional prebuilt AWS-S3 spatial index. Prefer this index in production because
+# IRSA SIA2/TAP has returned intermittent 502 proxy errors from the hosted region.
+# Set exactly one of these environment variables:
+#   CHRONOS_SPHEREX_INDEX_DIR=/path/to/spherex_index_tiles
+#   CHRONOS_SPHEREX_INDEX_URL=https://<public-static-host>/spherex-index
+INDEX_TILE_DEG = 5.0
+_INDEX_SESSION = requests.Session()
+S3 = "https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/"
 BLOCK = 2880
 NATIVE_PX = 6.15  # arcsec per SPHEREx pixel
 # FLAGS bits rejected (cosmic-ray TRANSIENT 0, OVERFLOW 1, SUR_ERROR 2, NONFUNC 6, DICHROIC 7, MISSING_DATA 9, HOT 10, COLD 11,
@@ -62,28 +70,103 @@ def _mask_flags(f, img, x0, y0, w, h):
 # HTTP functions are injected by app.py so SPHEREx uses the application's shared session.
 _GET: Callable = None  # type: ignore
 _POST: Callable = None  # type: ignore
+_VERIFY = True
+_USER_AGENT = "CHRONOS-102-V7.3/1.0"
+_TRANSIENT_HTTP = {502, 503, 504}
+
+# A second session bypasses HTTP(S)_PROXY / environment proxy settings. It is
+# used only after the normal application transport fails for an IRSA request.
+# This directly tests the exact failure mode seen on the hosted Vercel function.
+_DIRECT_SESSION = requests.Session()
+_DIRECT_SESSION.trust_env = False
+_DIRECT_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=24, max_retries=0))
+_DIRECT_SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=12, max_retries=0))
 
 
-def configure(getter: Callable, poster: Optional[Callable] = None):
-    global _GET, _POST
+def configure(getter: Callable, poster: Optional[Callable] = None,
+              verify: bool = True, user_agent: str = "CHRONOS-102-V7.3/1.0"):
+    global _GET, _POST, _VERIFY, _USER_AGENT
     _GET = getter
     _POST = poster
+    _VERIFY = bool(verify)
+    _USER_AGENT = user_agent or "CHRONOS-102-V7.3/1.0"
+
+
+def _direct_request(method: str, url: str, params=None, data=None,
+                    timeout: float = 40, headers_extra=None,
+                    allow_redirects=True):
+    headers = {"User-Agent": _USER_AGENT}
+    if headers_extra:
+        headers.update(headers_extra)
+    return _DIRECT_SESSION.request(
+        method=method,
+        url=url,
+        params=params,
+        data=data,
+        timeout=(min(8.0, float(timeout)), float(timeout)),
+        headers=headers,
+        verify=_VERIFY,
+        allow_redirects=allow_redirects,
+    )
 
 
 def _spx_get(url, params=None, timeout=40, retries=1, headers_extra=None):
-    """SPHEREx-only GET retry wrapper; do not change retry policy for other archives."""
+    """Try shared transport first, then direct egress if IRSA returns proxy/5xx errors."""
     if _GET is None:
         raise RuntimeError("SPHEREx HTTP getter is not configured")
-    last = None
-    for attempt in range(retries + 1):
-        try:
-            return _GET(url, params, timeout, retries=1, headers_extra=headers_extra)
-        except requests.Timeout as exc:
-            last = exc
-            if attempt >= retries:
-                raise
-            time.sleep(1.0 * (attempt + 1))
-    raise last
+
+    shared_problem = None
+    try:
+        response = _GET(url, params, timeout, retries=retries, headers_extra=headers_extra)
+        if response.status_code not in _TRANSIENT_HTTP:
+            response._chronos_transport = "shared-session"
+            return response
+        shared_problem = f"shared-session HTTP {response.status_code}"
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        shared_problem = f"shared-session {type(exc).__name__}: {str(exc)[:140]}"
+
+    # Do not let an environment proxy failure prevent a direct IRSA attempt.
+    try:
+        response = _direct_request("GET", url, params=params, timeout=timeout,
+                                   headers_extra=headers_extra, allow_redirects=True)
+        response._chronos_transport = "direct-no-env-proxy"
+        if response.status_code not in _TRANSIENT_HTTP:
+            return response
+        direct_problem = f"direct-no-env-proxy HTTP {response.status_code}"
+    except Exception as exc:  # noqa: BLE001
+        direct_problem = f"direct-no-env-proxy {type(exc).__name__}: {str(exc)[:140]}"
+
+    raise RuntimeError(f"IRSA GET failed via both transports ({shared_problem}; {direct_problem})")
+
+
+def _spx_post(url, data=None, timeout=40, retries=0, headers_extra=None, **kwargs):
+    """TAP POST with one direct-egress fallback; POST is not automatically replayed."""
+    if _POST is None:
+        raise RuntimeError("IRSA asynchronous TAP POST is not configured")
+
+    shared_problem = None
+    try:
+        response = _POST(url, data=data, timeout=timeout, retries=retries,
+                         headers_extra=headers_extra, **kwargs)
+        if response.status_code not in _TRANSIENT_HTTP:
+            response._chronos_transport = "shared-session"
+            return response
+        shared_problem = f"shared-session HTTP {response.status_code}"
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        shared_problem = f"shared-session {type(exc).__name__}: {str(exc)[:140]}"
+
+    try:
+        response = _direct_request("POST", url, data=data, timeout=timeout,
+                                   headers_extra=headers_extra,
+                                   allow_redirects=kwargs.get("allow_redirects", True))
+        response._chronos_transport = "direct-no-env-proxy"
+        if response.status_code not in _TRANSIENT_HTTP:
+            return response
+        direct_problem = f"direct-no-env-proxy HTTP {response.status_code}"
+    except Exception as exc:  # noqa: BLE001
+        direct_problem = f"direct-no-env-proxy {type(exc).__name__}: {str(exc)[:140]}"
+
+    raise RuntimeError(f"IRSA POST failed via both transports ({shared_problem}; {direct_problem})")
 
 
 def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
@@ -91,7 +174,7 @@ def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
     if _POST is None:
         raise RuntimeError("IRSA asynchronous TAP POST is not configured")
 
-    response = _POST(
+    response = _spx_post(
         TAP_ASYNC,
         data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql},
         timeout=30,
@@ -110,7 +193,7 @@ def _tap_async_csv(adql: str, timeout: float = 190.0) -> List[List[str]]:
         raise RuntimeError("IRSA async TAP returned an unexpected job URL")
 
     # UWS jobs are created in PENDING state; explicitly start the job.
-    run_response = _POST(job_url + "/phase", data={"PHASE": "RUN"}, timeout=20, retries=0, allow_redirects=False)
+    run_response = _spx_post(job_url + "/phase", data={"PHASE": "RUN"}, timeout=20, retries=0, allow_redirects=False)
     if run_response.status_code not in (200, 201, 202, 303):
         run_response.raise_for_status()
         raise RuntimeError(f"IRSA async TAP could not start job (HTTP {run_response.status_code})")
@@ -498,21 +581,53 @@ def _normalise_sia2_rows(rows: List[Dict[str, str]]) -> List[Dict]:
     return out
 
 
-def _list_images_sia2(ra: float, dec: float) -> List[Dict]:
-    params = [("COLLECTION", collection) for collection in SIA2_COLLECTIONS]
-    params.extend([
-        ("POS", f"circle {ra:.6f} {dec:.6f} 0.01"),
-        ("RESPONSEFORMAT", "CSV"),
-    ])
-    response = _spx_get(SIA2, params, timeout=55, retries=2)
+def _sia2_query_url(ra: float, dec: float) -> str:
+    """Build the same repeated-COLLECTION GET URL used by the successful Colab V7.3 test."""
+    collections = "&".join(f"COLLECTION={collection}" for collection in SIA2_COLLECTIONS)
+    return (f"{SIA2}?{collections}"
+            f"&POS=circle+{ra:.6f}+{dec:.6f}+0.01"
+            "&RESPONSEFORMAT=CSV")
+
+
+def _sia2_fetch_rows(ra: float, dec: float, timeout: float = 55.0):
+    """Fetch SIA2 CSV using the Colab-tested URL and validate the response."""
+    url = _sia2_query_url(ra, dec)
+    response = _spx_get(url, None, timeout=timeout, retries=2)
     response.raise_for_status()
-    body = response.text.strip()
+    body = (response.text or "").lstrip("\ufeff").strip()
     if body.startswith("<"):
         messages = [x.strip() for x in re.findall(r"<INFO[^>]*>([^<]*)</INFO>", body, re.S) if x.strip()]
-        raise RuntimeError("IRSA SIA2 returned an XML error: " + (messages[0] if messages else re.sub(r"\s+", " ", body)[:200]))
+        message = messages[0] if messages else re.sub(r"\s+", " ", body)[:200]
+        raise RuntimeError("IRSA SIA2 returned an XML error: " + message)
     rows = _csv_dict_rows(body)
     if rows and not any(_row_value(row, "access_url") for row in rows):
         raise RuntimeError("IRSA SIA2 returned records without an access_url column")
+    return response, rows
+
+
+def probe_sia2(ra: float, dec: float, timeout: float = 18.0) -> Dict:
+    """Probe production SIA2, reporting transport, raw rows and usable FITS rows."""
+    try:
+        response, rows = _sia2_fetch_rows(ra, dec, timeout=timeout)
+        images = _normalise_sia2_rows(rows)
+        result = {
+            "ok": bool(response.status_code == 200 and (not rows or images)),
+            "http": response.status_code,
+            "records": len(rows),
+            "fits_records": len(images),
+            "transport": getattr(response, "_chronos_transport", "shared-session"),
+            "collections": list(SIA2_COLLECTIONS),
+        }
+        if rows and not images:
+            result["error"] = "SIA2 returned rows, but none matched the SPHEREx Level-2 FITS metadata; columns=" + ",".join(rows[0].keys())[:180]
+        return result
+    except Exception as exc:  # noqa: BLE001
+        detail = re.sub(r"\s+", " ", str(exc))[:260]
+        return {"ok": False, "error": f"{type(exc).__name__}: {detail}"}
+
+
+def _list_images_sia2(ra: float, dec: float) -> List[Dict]:
+    response, rows = _sia2_fetch_rows(ra, dec, timeout=55.0)
     normalised = _normalise_sia2_rows(rows)
     if rows and not normalised:
         raise RuntimeError("IRSA SIA2 returned records, but none matched the expected SPHEREx Level-2 FITS filename/metadata format")
@@ -550,21 +665,116 @@ def _list_images_tap_fallback(ra: float, dec: float) -> List[Dict]:
     return out
 
 
+def _index_tile_name(ra: float, dec: float) -> str:
+    """Return the 5-degree static-index shard containing an ICRS coordinate."""
+    ra = float(ra) % 360.0
+    dec = max(-90.0, min(90.0, float(dec)))
+    n_ra = int(round(360.0 / INDEX_TILE_DEG))
+    n_dec = int(round(180.0 / INDEX_TILE_DEG))
+    ix = min(n_ra - 1, int(ra // INDEX_TILE_DEG))
+    iy = min(n_dec - 1, max(0, int((dec + 90.0) // INDEX_TILE_DEG)))
+    return f"tile_ra_{ix:03d}_dec_{iy:02d}.jsonl.gz"
+
+
+def _list_images_spatial_index(ra: float, dec: float) -> List[Dict]:
+    """Read one prebuilt 5-degree S3-index shard and retain conservative footprint hits.
+
+    The shard contains every image whose WCS footprint intersects its sky tile.
+    The radius test is deliberately conservative; sample_point()/reproject() perform
+    the authoritative per-pixel WCS containment check before using any image data.
+    """
+    local_dir = os.environ.get("CHRONOS_SPHEREX_INDEX_DIR", "").strip()
+    base_url = os.environ.get("CHRONOS_SPHEREX_INDEX_URL", "").strip().rstrip("/")
+    if not local_dir and not base_url:
+        raise RuntimeError("SPHEREx spatial index is not configured")
+
+    filename = _index_tile_name(ra, dec)
+    if local_dir:
+        path = os.path.join(local_dir, filename)
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            lines = fh
+            raw_items = [json.loads(line) for line in lines if line.strip()]
+    else:
+        response = _INDEX_SESSION.get(
+            f"{base_url}/{filename}", timeout=(6.0, 25.0),
+            headers={"Accept": "application/gzip, application/octet-stream"},
+        )
+        response.raise_for_status()
+        blob = response.content
+        # Some CDNs may transparently decode Content-Encoding: gzip. The shard
+        # itself is a .gz object, so accept either the raw gzip stream or decoded text.
+        if blob[:2] == b"\x1f\x8b":
+            blob = gzip.decompress(blob)
+        payload = blob.decode("utf-8")
+        raw_items = [json.loads(line) for line in payload.splitlines() if line.strip()]
+
+    # Great-circle separation from image center; radius includes a small WCS margin.
+    ra0 = math.radians(float(ra) % 360.0)
+    dec0 = math.radians(float(dec))
+    out = []
+    for raw in raw_items:
+        try:
+            r1 = math.radians(float(raw["center_ra"]) % 360.0)
+            d1 = math.radians(float(raw["center_dec"]))
+            cos_sep = (math.sin(dec0) * math.sin(d1)
+                       + math.cos(dec0) * math.cos(d1) * math.cos(ra0 - r1))
+            sep = math.degrees(math.acos(max(-1.0, min(1.0, cos_sep))))
+            if sep > float(raw.get("radius_deg", 3.0)):
+                continue
+            item = {
+                "uri": raw["uri"],
+                "cloud_access": None,
+                "mjd": float(raw["mjd"]),
+                "det": int(raw["det"]),
+                "obs": str(raw["obs"]),
+                "release": str(raw["release"]),
+                "collection": str(raw.get("collection", "")),
+                "product": str(raw.get("product", "l2b")),
+                "index_source": "aws-s3-spatial-index",
+            }
+            out.append(item)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    out.sort(key=lambda item: item["mjd"])
+    return out
+
+
 def list_images(ra: float, dec: float, cache_dir: str) -> List[Dict]:
-    """SIA2-first discovery across DR1/QR3 wide and deep collections; TAP async is a fallback."""
-    key = f"v4-sia2|{ra:.5f}|{dec:.5f}"
+    """Discover SPHEREx images from the prebuilt S3 index, then IRSA SIA2/TAP.
+
+    The index is the production path when CHRONOS_SPHEREX_INDEX_DIR or
+    CHRONOS_SPHEREX_INDEX_URL is configured. SIA2/TAP remain as fallbacks so
+    existing deployments continue to work before the index is deployed.
+    """
+    index_configured = bool(
+        os.environ.get("CHRONOS_SPHEREX_INDEX_DIR", "").strip()
+        or os.environ.get("CHRONOS_SPHEREX_INDEX_URL", "").strip()
+    )
+    source_mode = "spatial-index" if index_configured else "irsa"
+    index_identity = (os.environ.get("CHRONOS_SPHEREX_INDEX_URL", "")
+                      or os.environ.get("CHRONOS_SPHEREX_INDEX_DIR", ""))
+    index_tag = hashlib.sha1(index_identity.encode("utf-8")).hexdigest()[:8] if index_identity else "none"
+    key = f"v5-{source_mode}-{index_tag}|{ra:.5f}|{dec:.5f}"
     hit = _cached("list", key, cache_dir, max_age=86400)
     if hit is not None:
         return hit
+
+    index_error = None
+    if index_configured:
+        try:
+            out = _list_images_spatial_index(ra, dec)
+            _store("list", key, cache_dir, out)
+            return out
+        except Exception as exc:  # index unavailable/incomplete: retain IRSA fallback
+            index_error = exc
+
     sia_error = None
     try:
         out = _list_images_sia2(ra, dec)
-        # A successful empty SIA2 result is a valid no-coverage answer. Do not turn it
-        # into a long TAP wait; the SIA2 index can lag the newest weekly ingest by about a day.
         if out:
             _store("list", key, cache_dir, out)
         return out
-    except Exception as exc:  # Use TAP async only if the SIA2 request itself failed.
+    except Exception as exc:
         sia_error = exc
     try:
         out = _list_images_tap_fallback(ra, dec)
@@ -575,11 +785,19 @@ def list_images(ra: float, dec: float, cache_dir: str) -> List[Dict]:
             _store("list", key, cache_dir, [])
             return []
     except Exception as tap_error:
+        details = []
+        if index_error is not None:
+            details.append(f"S3 index failed ({type(index_error).__name__}: {str(index_error)[:100]})")
         if sia_error is not None:
-            raise RuntimeError(f"SIA2 failed ({type(sia_error).__name__}: {str(sia_error)[:120]}); TAP fallback failed ({type(tap_error).__name__}: {str(tap_error)[:120]})") from tap_error
-        raise
+            details.append(f"SIA2 failed ({type(sia_error).__name__}: {str(sia_error)[:100]})")
+        details.append(f"TAP fallback failed ({type(tap_error).__name__}: {str(tap_error)[:100]})")
+        raise RuntimeError("; ".join(details)) from tap_error
     if sia_error is not None:
-        raise RuntimeError(f"SIA2 query failed ({type(sia_error).__name__}: {str(sia_error)[:180]}) and TAP fallback returned no usable rows")
+        details = []
+        if index_error is not None:
+            details.append(f"S3 index failed ({type(index_error).__name__}: {str(index_error)[:100]})")
+        details.append(f"SIA2 query failed ({type(sia_error).__name__}: {str(sia_error)[:150]})")
+        raise RuntimeError("; ".join(details))
     _store("list", key, cache_dir, [])
     return []
 
